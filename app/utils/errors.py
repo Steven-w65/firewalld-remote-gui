@@ -1,3 +1,15 @@
+from typing import Protocol
+
+
+class HostKeyChallengeDetails(Protocol):
+    """Safe challenge fields carried by an unknown-host-key domain error."""
+
+    host: str
+    port: int
+    algorithm: str
+    fingerprint_sha256: str
+
+
 class ConfigurationError(ValueError):
     """Raised when the portable configuration is invalid."""
 
@@ -21,7 +33,7 @@ class HostKeyStoreError(RuntimeError):
 class UnknownHostKeyError(RuntimeError):
     """Raised when a host key needs explicit user confirmation."""
 
-    def __init__(self, challenge: object) -> None:
+    def __init__(self, challenge: HostKeyChallengeDetails) -> None:
         self.challenge = challenge
         super().__init__(
             "SSH host key for "

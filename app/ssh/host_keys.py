@@ -42,8 +42,8 @@ class HostKeyStore:
             UnicodeError,
             paramiko.SSHException,
             paramiko.hostkeys.InvalidHostKey,
-        ) as error:
-            raise HostKeyStoreError() from error
+        ):
+            raise HostKeyStoreError() from None
         return keys
 
     def challenge(self, host: str, port: int, key: paramiko.PKey) -> HostKeyChallenge:
@@ -109,6 +109,7 @@ class HostKeyStore:
         return f"SHA256:{encoded}"
 
     def _save_atomically(self, keys: paramiko.HostKeys) -> None:
+        descriptor: int | None = None
         temporary_file: Path | None = None
         try:
             self._known_hosts_file.parent.mkdir(parents=True, exist_ok=True)
@@ -117,16 +118,22 @@ class HostKeyStore:
                 suffix=".tmp",
                 dir=self._known_hosts_file.parent,
             )
-            os.close(descriptor)
             temporary_file = Path(temporary_name)
+            os.close(descriptor)
+            descriptor = None
             keys.save(str(temporary_file))
             with temporary_file.open("r+b") as output:
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary_file, self._known_hosts_file)
-        except (OSError, paramiko.SSHException) as error:
-            raise HostKeyStoreError() from error
+        except (OSError, paramiko.SSHException):
+            raise HostKeyStoreError() from None
         finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             if temporary_file is not None:
                 try:
                     temporary_file.unlink(missing_ok=True)
