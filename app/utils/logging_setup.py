@@ -65,22 +65,33 @@ class SecretRedactionFilter(logging.Filter):
             record.exc_text = self._redact_text(record.exc_text)
         return True
 
-    def _sanitize_value(self, value):
+    def _sanitize_value(self, value, active_ids=None):
+        if active_ids is None:
+            active_ids = set()
         if self._is_app_config(value):
             return "[REDACTED CONFIG]"
-        if isinstance(value, Mapping):
-            return {
-                key: "[REDACTED]" if self._is_sensitive_key(key) else self._sanitize_value(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, tuple):
-            return tuple(self._sanitize_value(item) for item in value)
-        if isinstance(value, list):
-            return [self._sanitize_value(item) for item in value]
-        if isinstance(value, set):
-            return {self._sanitize_value(item) for item in value}
-        if isinstance(value, frozenset):
-            return frozenset(self._sanitize_value(item) for item in value)
+        if isinstance(value, (Mapping, tuple, list, set, frozenset)):
+            value_id = id(value)
+            if value_id in active_ids:
+                return "[REDACTED CYCLE]"
+            active_ids.add(value_id)
+            try:
+                if isinstance(value, Mapping):
+                    return {
+                        key: "[REDACTED]"
+                        if self._is_sensitive_key(key)
+                        else self._sanitize_value(item, active_ids)
+                        for key, item in value.items()
+                    }
+                if isinstance(value, tuple):
+                    return tuple(self._sanitize_value(item, active_ids) for item in value)
+                if isinstance(value, list):
+                    return [self._sanitize_value(item, active_ids) for item in value]
+                if isinstance(value, set):
+                    return {self._sanitize_value(item, active_ids) for item in value}
+                return frozenset(self._sanitize_value(item, active_ids) for item in value)
+            finally:
+                active_ids.remove(value_id)
         return self._redact_text(value) if isinstance(value, str) else value
 
     @staticmethod
@@ -98,17 +109,37 @@ class SecretRedactionFilter(logging.Filter):
 
     def _render_exception(self, exc_info) -> str:
         exception = exc_info[1]
-        if exception and self._contains_app_config(getattr(exception, "args", ())):
+        exception_args = getattr(exception, "args", ()) if exception else ()
+        sanitized_args = self._sanitize_value(exception_args)
+        if exception and self._contains_app_config(exception_args):
             return f"{type(exception).__name__}: [REDACTED CONFIG]"
+        if "[REDACTED CYCLE]" in repr(sanitized_args):
+            return self._redact_text(f"{type(exception).__name__}: {sanitized_args}")
         return self._redact_text("".join(traceback.format_exception(*exc_info)))
 
-    def _contains_app_config(self, value) -> bool:
+    def _contains_app_config(self, value, active_ids=None) -> bool:
+        if active_ids is None:
+            active_ids = set()
         if self._is_app_config(value):
             return True
         if isinstance(value, Mapping):
-            return any(self._contains_app_config(item) for item in value.values())
+            value_id = id(value)
+            if value_id in active_ids:
+                return False
+            active_ids.add(value_id)
+            try:
+                return any(self._contains_app_config(item, active_ids) for item in value.values())
+            finally:
+                active_ids.remove(value_id)
         if isinstance(value, (tuple, list, set, frozenset)):
-            return any(self._contains_app_config(item) for item in value)
+            value_id = id(value)
+            if value_id in active_ids:
+                return False
+            active_ids.add(value_id)
+            try:
+                return any(self._contains_app_config(item, active_ids) for item in value)
+            finally:
+                active_ids.remove(value_id)
         return False
 
     def _redact_text(self, text: str) -> str:

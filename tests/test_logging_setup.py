@@ -120,6 +120,42 @@ def test_filter_redacts_quoted_multi_word_credential_values_in_text():
     assert message.count("[REDACTED]") == 2
 
 
+def test_filter_safely_sanitizes_cyclic_mapping_and_list_message_arguments():
+    mapping = {"password": "mapping-secret"}
+    mapping["self"] = mapping
+    values = ["list-secret"]
+    values.append(values)
+    record = _record("payload=%s", {"mapping": mapping, "values": values})
+
+    SecretRedactionFilter(["mapping-secret", "list-secret"]).filter(record)
+
+    rendered = record.getMessage()
+    assert "mapping-secret" not in rendered
+    assert "list-secret" not in rendered
+    assert "[REDACTED CYCLE]" in rendered
+    assert mapping["password"] == "mapping-secret"
+    assert mapping["self"] is mapping
+    assert values[0] == "list-secret"
+    assert values[1] is values
+
+
+def test_filter_safely_sanitizes_cyclic_exception_arguments():
+    values = [{"credential": "exception-secret"}]
+    values.append(values)
+    try:
+        raise RuntimeError(values)
+    except RuntimeError:
+        record = logging.LogRecord("app", logging.ERROR, __file__, 1, "request failed", (), sys.exc_info())
+
+    SecretRedactionFilter(["exception-secret"]).filter(record)
+
+    rendered = logging.Formatter("%(message)s\n%(exc_text)s").format(record)
+    assert "exception-secret" not in rendered
+    assert "[REDACTED CYCLE]" in rendered
+    assert values[0]["credential"] == "exception-secret"
+    assert values[1] is values
+
+
 def test_filter_ignores_empty_secrets():
     record = _record("connected to %s", "firewalld")
 
