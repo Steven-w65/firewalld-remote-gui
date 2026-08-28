@@ -1,0 +1,23 @@
+application:
+  ssh_timeout: 10.0
+  command_timeout: 20.0
+  confirm_changes: true
+  strict_host_key_checking: true
+
+servers:
+  - id: web01
+    name: Documentation web server
+    host: 192.0.2.10
+    username: admin
+    password: change-me
+    sudo: true
+  - id: database01
+    name: Documentation database server
+    host: 198.51.100.20
+    username: dbadmin
+    password: change-me
+  - id: application01
+    name: Documentation application server
+    host: 203.0.113.30
+    username: deploy
+    password: change-me
