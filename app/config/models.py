@@ -27,6 +27,9 @@ class LoadedConfig:
     application: ApplicationConfig
     servers: tuple[ServerConfig, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "servers", tuple(self.servers))
+
 
 @dataclass(frozen=True, slots=True)
 class ConfigDiff:
@@ -34,3 +37,9 @@ class ConfigDiff:
     changed: tuple[str, ...]
     added: tuple[str, ...]
     removed: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "unchanged", tuple(self.unchanged))
+        object.__setattr__(self, "changed", tuple(self.changed))
+        object.__setattr__(self, "added", tuple(self.added))
+        object.__setattr__(self, "removed", tuple(self.removed))

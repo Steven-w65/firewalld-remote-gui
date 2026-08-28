@@ -12,6 +12,7 @@ from dataclasses import is_dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import RLock
+from types import TracebackType
 
 
 _LOG_FILE_NAME = "remote-firewalld-manager.log"
@@ -65,7 +66,11 @@ class SecretRedactionFilter(logging.Filter):
             record.exc_text = self._redact_text(record.exc_text)
         return True
 
-    def _sanitize_value(self, value, active_ids=None):
+    def _sanitize_value(
+        self,
+        value: object,
+        active_ids: set[int] | None = None,
+    ) -> object:
         if active_ids is None:
             active_ids = set()
         if self._is_app_config(value):
@@ -95,19 +100,26 @@ class SecretRedactionFilter(logging.Filter):
         return self._redact_text(value) if isinstance(value, str) else value
 
     @staticmethod
-    def _is_app_config(value) -> bool:
+    def _is_app_config(value: object) -> bool:
         value_type = type(value)
         return is_dataclass(value) and value_type.__module__.startswith("app.config")
 
     @staticmethod
-    def _is_sensitive_key(key) -> bool:
+    def _is_sensitive_key(key: object) -> bool:
         return isinstance(key, str) and key.strip(" '\"").casefold() in {
             "password",
             "passphrase",
             "credential",
         }
 
-    def _render_exception(self, exc_info) -> str:
+    def _render_exception(
+        self,
+        exc_info: tuple[
+            type[BaseException] | None,
+            BaseException | None,
+            TracebackType | None,
+        ],
+    ) -> str:
         exception = exc_info[1]
         exception_args = getattr(exception, "args", ()) if exception else ()
         sanitized_args = self._sanitize_value(exception_args)
@@ -117,7 +129,11 @@ class SecretRedactionFilter(logging.Filter):
             return self._redact_text(f"{type(exception).__name__}: {sanitized_args}")
         return self._redact_text("".join(traceback.format_exception(*exc_info)))
 
-    def _contains_app_config(self, value, active_ids=None) -> bool:
+    def _contains_app_config(
+        self,
+        value: object,
+        active_ids: set[int] | None = None,
+    ) -> bool:
         if active_ids is None:
             active_ids = set()
         if self._is_app_config(value):
@@ -149,7 +165,10 @@ class SecretRedactionFilter(logging.Filter):
         return _SENSITIVE_VALUE_PATTERN.sub(r"\g<key>\g<separator>[REDACTED]", redacted)
 
 
-def _replace_redactor(filterer, redactor: SecretRedactionFilter) -> None:
+def _replace_redactor(
+    filterer: logging.Filterer,
+    redactor: SecretRedactionFilter,
+) -> None:
     for existing_filter in filterer.filters[:]:
         if isinstance(existing_filter, SecretRedactionFilter):
             filterer.removeFilter(existing_filter)

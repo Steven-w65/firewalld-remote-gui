@@ -7,7 +7,7 @@ from collections.abc import Collection
 from app.utils.errors import InvalidFirewallArgumentError
 
 
-_PORT_PATTERN = re.compile(r"([0-9]+)(?:-([0-9]+))?\Z", re.ASCII)
+_PORT_PATTERN = re.compile(r"([0-9]{1,5})(?:-([0-9]{1,5}))?\Z", re.ASCII)
 _PROTOCOLS = frozenset({"tcp", "udp"})
 _RICH_ACTIONS = frozenset({"accept", "reject", "drop"})
 _INVENTORY_LABELS = frozenset({"zone", "service", "interface"})

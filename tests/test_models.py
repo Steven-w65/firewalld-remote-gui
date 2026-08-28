@@ -107,6 +107,18 @@ def test_zone_state_copies_mutable_collections():
     assert all(isinstance(value, tuple) for value in (zone.interfaces, zone.sources, zone.services, zone.ports, zone.rich_rules))
 
 
+def test_zone_state_defaults_to_runtime_state():
+    assert ZoneState("public").permanent is False
+
+
+def test_zone_state_accepts_an_explicit_frozen_permanent_state():
+    zone = ZoneState("public", permanent=True)
+
+    assert zone.permanent is True
+    with pytest.raises(FrozenInstanceError):
+        zone.permanent = False
+
+
 def test_snapshot_copies_mutable_collections():
     runtime_zones = [ZoneState("public")]
     permanent_zones = [ZoneState("internal")]

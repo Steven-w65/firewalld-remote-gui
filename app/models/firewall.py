@@ -46,6 +46,7 @@ class ZoneState:
     rich_rules: tuple[RichRule, ...] = ()
     masquerade: bool = False
     forwarding: bool = False
+    permanent: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "interfaces", tuple(self.interfaces))

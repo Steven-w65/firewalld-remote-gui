@@ -1,4 +1,5 @@
-from collections.abc import Mapping
+import math
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 import yaml
@@ -10,7 +11,7 @@ from app.utils.errors import ConfigurationError
 class ConfigManager:
     _APPLICATION_FIELDS = {"ssh_timeout", "command_timeout", "confirm_changes", "strict_host_key_checking"}
     _SERVER_FIELDS = {"id", "name", "host", "username", "password", "port", "sudo", "connect_timeout", "command_timeout"}
-    _REQUIRED_SERVER_FIELDS = {"id", "name", "host", "username", "password"}
+    _REQUIRED_SERVER_FIELDS = ("id", "name", "host", "username", "password")
 
     def __init__(self, path: Path):
         self._path = path
@@ -18,7 +19,9 @@ class ConfigManager:
     def load(self) -> LoadedConfig:
         try:
             data = yaml.safe_load(self._path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as error:
+        except yaml.YAMLError:
+            raise ConfigurationError("unable to read configuration") from None
+        except OSError as error:
             raise ConfigurationError("unable to read configuration") from error
         if not isinstance(data, Mapping):
             raise ConfigurationError("configuration must be a mapping")
@@ -74,7 +77,7 @@ class ConfigManager:
         return ServerConfig(data["id"], data["name"], data["host"], data["username"], data["password"], port, sudo, connect_timeout, command_timeout)
 
     @staticmethod
-    def _reject_unknown(data: Mapping, allowed: set[str], path: str) -> None:
+    def _reject_unknown(data: Mapping, allowed: Collection[str], path: str) -> None:
         for field in data:
             if field not in allowed:
                 raise ConfigurationError(f"{path}.{field}: unknown field")
@@ -87,9 +90,15 @@ class ConfigManager:
 
     @staticmethod
     def _timeout(value: object, path: str) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigurationError(f"{path} must be a positive number")
-        return float(value)
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ConfigurationError(f"{path} must be a positive number") from None
+        if not math.isfinite(normalized) or normalized <= 0:
+            raise ConfigurationError(f"{path} must be a positive number")
+        return normalized
 
     @classmethod
     def _optional_timeout(cls, value: object, path: str) -> float | None:

@@ -24,6 +24,14 @@ def test_rejects_invalid_ports(value):
         validate_port(value)
 
 
+@pytest.mark.parametrize("value", (("9" * 5000), ("1-" + ("9" * 5000))))
+def test_rejects_oversized_port_components_with_a_safe_domain_error(value):
+    with pytest.raises(InvalidFirewallArgumentError) as error:
+        validate_port(value)
+
+    assert value not in str(error.value)
+
+
 @pytest.mark.parametrize("value, expected", [("TCP", "tcp"), ("udp", "udp")])
 def test_protocol_is_normalized_after_validation(value, expected):
     assert validate_protocol(value) == expected

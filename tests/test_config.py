@@ -1,9 +1,11 @@
+import re
+import traceback
 from dataclasses import replace
 
 import pytest
 
 from app.config.config_manager import ConfigManager
-from app.config.models import ApplicationConfig, LoadedConfig, ServerConfig
+from app.config.models import ApplicationConfig, ConfigDiff, LoadedConfig, ServerConfig
 from app.utils.errors import ConfigurationError
 
 
@@ -75,6 +77,73 @@ def test_configuration_errors_never_echo_password_values(tmp_path):
     assert "do-not-echo" not in str(error.value)
 
 
+def test_malformed_yaml_traceback_never_echoes_password_values(tmp_path):
+    path = tmp_path / "config.yaml"
+    password = "malformed-yaml-password"
+    write_config(
+        path,
+        "servers:\n"
+        "  - id: a\n"
+        "    name: A\n"
+        "    host: h\n"
+        "    username: u\n"
+        f'    password: "{password}\n',
+    )
+
+    with pytest.raises(ConfigurationError) as error:
+        ConfigManager(path).load()
+
+    rendered = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    assert password not in rendered
+
+
+_OVERFLOWING_TIMEOUT = "1" + ("0" * 400)
+_INVALID_TIMEOUTS = ("0", "true", ".nan", ".inf", _OVERFLOWING_TIMEOUT)
+
+
+@pytest.mark.parametrize("field", ("ssh_timeout", "command_timeout"))
+@pytest.mark.parametrize("value", _INVALID_TIMEOUTS)
+def test_rejects_invalid_application_timeouts_with_safe_path_error(
+    tmp_path,
+    field,
+    value,
+):
+    path = tmp_path / "config.yaml"
+    write_config(path, f"application: {{{field}: {value}}}\nservers: []")
+
+    with pytest.raises(
+        ConfigurationError,
+        match=re.escape(f"application.{field}"),
+    ) as error:
+        ConfigManager(path).load()
+
+    assert str(error.value) == f"application.{field} must be a positive number"
+
+
+@pytest.mark.parametrize("field", ("connect_timeout", "command_timeout"))
+@pytest.mark.parametrize("value", _INVALID_TIMEOUTS)
+def test_rejects_invalid_server_timeouts_with_safe_path_error(
+    tmp_path,
+    field,
+    value,
+):
+    path = tmp_path / "config.yaml"
+    write_config(
+        path,
+        "servers:\n"
+        "  - {id: a, name: A, host: h, username: u, password: p, "
+        f"{field}: {value}}}",
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match=re.escape(f"servers[0].{field}"),
+    ) as error:
+        ConfigManager(path).load()
+
+    assert str(error.value) == f"servers[0].{field} must be a positive number"
+
+
 def test_diff_classifies_all_server_categories():
     unchanged = ServerConfig("same", "Same", "192.0.2.1", "u", "p")
     changed_old = ServerConfig("changed", "Old", "192.0.2.2", "u", "p")
@@ -88,3 +157,32 @@ def test_diff_classifies_all_server_categories():
     assert diff.changed == ("changed",)
     assert diff.added == ("added",)
     assert diff.removed == ("removed",)
+
+
+def test_loaded_config_copies_a_mutable_server_collection():
+    servers = [ServerConfig("server-a", "A", "192.0.2.1", "u", "p")]
+
+    loaded = LoadedConfig(ApplicationConfig(), servers)
+    servers.append(ServerConfig("server-b", "B", "192.0.2.2", "u", "p"))
+
+    assert loaded.servers == (ServerConfig("server-a", "A", "192.0.2.1", "u", "p"),)
+    assert isinstance(loaded.servers, tuple)
+
+
+def test_config_diff_copies_mutable_category_collections():
+    unchanged = ["same"]
+    changed = ["changed"]
+    added = ["added"]
+    removed = ["removed"]
+
+    diff = ConfigDiff(unchanged, changed, added, removed)
+    unchanged.append("later")
+    changed.append("later")
+    added.append("later")
+    removed.append("later")
+
+    assert diff == ConfigDiff(("same",), ("changed",), ("added",), ("removed",))
+    assert all(
+        isinstance(category, tuple)
+        for category in (diff.unchanged, diff.changed, diff.added, diff.removed)
+    )
