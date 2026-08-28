@@ -11,6 +11,7 @@ _PORT_PATTERN = re.compile(r"([0-9]{1,5})(?:-([0-9]{1,5}))?\Z", re.ASCII)
 _PROTOCOLS = frozenset({"tcp", "udp"})
 _RICH_ACTIONS = frozenset({"accept", "reject", "drop"})
 _INVENTORY_LABELS = frozenset({"zone", "service", "interface"})
+_INVENTORY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z", re.ASCII)
 
 
 def _text(value: str, field: str) -> str:
@@ -41,9 +42,18 @@ def validate_protocol(value: str) -> str:
 
 def validate_inventory_value(kind: str, value: str, allowed: Collection[str]) -> str:
     label = kind if kind in _INVENTORY_LABELS else "inventory value"
-    value = _text(value, label)
+    value = validate_inventory_token(kind, value)
     if value not in allowed:
         raise InvalidFirewallArgumentError(label, "must match an item in the remote inventory")
+    return value
+
+
+def validate_inventory_token(kind: str, value: str) -> str:
+    """Validate an inventory-shaped value before a remote inventory is available."""
+    label = kind if kind in _INVENTORY_LABELS else "inventory value"
+    value = _text(value, label)
+    if _INVENTORY_TOKEN_PATTERN.fullmatch(value) is None:
+        raise InvalidFirewallArgumentError(label, "contains unsupported characters")
     return value
 
 

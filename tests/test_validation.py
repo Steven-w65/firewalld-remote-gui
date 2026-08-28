@@ -2,6 +2,7 @@ import pytest
 
 from app.utils.errors import InvalidFirewallArgumentError
 from app.utils.validation import (
+    validate_inventory_token,
     validate_inventory_value,
     validate_ip_network,
     validate_port,
@@ -60,6 +61,17 @@ def test_inventory_value_must_come_from_remote_inventory():
         validate_inventory_value("zone", "public;id", {"public", "internal"})
     with pytest.raises(InvalidFirewallArgumentError):
         validate_inventory_value("zone", " public", {"public"})
+
+
+@pytest.mark.parametrize("kind, value", [("zone", "public"), ("service", "RH-Satellite-6"), ("interface", "br-0.1:2")])
+def test_inventory_tokens_are_safe_before_live_inventory_is_available(kind, value):
+    assert validate_inventory_token(kind, value) == value
+
+
+@pytest.mark.parametrize("kind, value", [("zone", "public;id"), ("service", "ssh$(id)"), ("interface", "eth0/../../x"), ("zone", "--trusted")])
+def test_inventory_token_validator_rejects_shell_or_option_shaped_values(kind, value):
+    with pytest.raises(InvalidFirewallArgumentError):
+        validate_inventory_token(kind, value)
 
 
 def test_inventory_error_does_not_echo_untrusted_kind():
