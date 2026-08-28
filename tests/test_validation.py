@@ -54,6 +54,12 @@ def test_inventory_value_must_come_from_remote_inventory():
         validate_inventory_value("zone", " public", {"public"})
 
 
+def test_inventory_error_does_not_echo_untrusted_kind():
+    with pytest.raises(InvalidFirewallArgumentError) as error:
+        validate_inventory_value("token=secret", "missing", {"public"})
+    assert "token=secret" not in str(error.value)
+
+
 @pytest.mark.parametrize(
     "value, expected",
     [("192.0.2.4/24", "192.0.2.0/24"), ("2001:db8::1/64", "2001:db8::/64")],
