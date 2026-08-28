@@ -1,13 +1,9 @@
-from typing import Protocol
+from __future__ import annotations
 
+from typing import TYPE_CHECKING
 
-class HostKeyChallengeDetails(Protocol):
-    """Safe challenge fields carried by an unknown-host-key domain error."""
-
-    host: str
-    port: int
-    algorithm: str
-    fingerprint_sha256: str
+if TYPE_CHECKING:
+    from app.ssh.host_keys import HostKeyChallenge
 
 
 class ConfigurationError(ValueError):
@@ -33,8 +29,8 @@ class HostKeyStoreError(RuntimeError):
 class UnknownHostKeyError(RuntimeError):
     """Raised when a host key needs explicit user confirmation."""
 
-    def __init__(self, challenge: HostKeyChallengeDetails) -> None:
-        self.challenge = challenge
+    def __init__(self, challenge: HostKeyChallenge) -> None:
+        self.challenge: HostKeyChallenge = challenge
         super().__init__(
             "SSH host key for "
             f"{challenge.host}:{challenge.port} requires explicit trust "

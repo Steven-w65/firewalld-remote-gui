@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import traceback
+import typing
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,7 +9,8 @@ import paramiko
 import pytest
 
 from app.ssh import host_keys
-from app.ssh.host_keys import HostKeyStore
+from app.ssh.host_keys import HostKeyChallenge, HostKeyStore
+from app.utils import errors
 from app.utils.errors import ChangedHostKeyError, HostKeyStoreError, UnknownHostKeyError
 
 
@@ -23,6 +25,18 @@ def formatted_exception(error: BaseException) -> str:
 
 def temporary_files(known_hosts: Path) -> list[Path]:
     return list(known_hosts.parent.glob(f".{known_hosts.name}.*.tmp"))
+
+
+def test_unknown_host_key_error_and_store_trust_share_the_concrete_challenge_type():
+    """Catches a partial error annotation that cannot be passed directly to trust()."""
+    error_hints = typing.get_type_hints(
+        errors.UnknownHostKeyError.__init__,
+        globalns={"HostKeyChallenge": HostKeyChallenge},
+    )
+    trust_hints = typing.get_type_hints(HostKeyStore.trust)
+
+    assert error_hints["challenge"] is HostKeyChallenge
+    assert trust_hints["challenge"] is HostKeyChallenge
 
 
 def test_unknown_key_exposes_safe_challenge_without_trusting(tmp_path):
