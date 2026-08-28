@@ -47,6 +47,13 @@ class ZoneState:
     masquerade: bool = False
     forwarding: bool = False
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "interfaces", tuple(self.interfaces))
+        object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "services", tuple(self.services))
+        object.__setattr__(self, "ports", tuple(self.ports))
+        object.__setattr__(self, "rich_rules", tuple(self.rich_rules))
+
 
 @dataclass(frozen=True, slots=True)
 class FirewallSnapshot:
@@ -59,6 +66,11 @@ class FirewallSnapshot:
     permanent_zones: tuple[ZoneState, ...] = field(default_factory=tuple)
     available_services: tuple[str, ...] = field(default_factory=tuple)
     stale: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "runtime_zones", tuple(self.runtime_zones))
+        object.__setattr__(self, "permanent_zones", tuple(self.permanent_zones))
+        object.__setattr__(self, "available_services", tuple(self.available_services))
 
     def zone(self, name: str, permanent: bool) -> ZoneState | None:
         zones = self.permanent_zones if permanent else self.runtime_zones

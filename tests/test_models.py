@@ -73,3 +73,51 @@ def test_models_are_frozen_value_objects():
 
     with pytest.raises(FrozenInstanceError):
         spec.operation = "other"
+
+
+def test_command_spec_copies_mutable_argv():
+    argv = ["firewall-cmd", "--get-zones"]
+
+    spec = CommandSpec("list_zones", argv)
+    argv.append("--permanent")
+
+    assert spec.argv == ("firewall-cmd", "--get-zones")
+    assert isinstance(spec.argv, tuple)
+
+
+def test_zone_state_copies_mutable_collections():
+    interfaces = ["eth0"]
+    sources = ["192.0.2.0/24"]
+    services = ["ssh"]
+    ports = [FirewallPort("22", "tcp", "public", True, False)]
+    rich_rules = [RichRule('rule service name="ssh" accept')]
+
+    zone = ZoneState("public", interfaces, sources, services, ports, rich_rules)
+    interfaces.append("eth1")
+    sources.append("198.51.100.0/24")
+    services.append("http")
+    ports.append(FirewallPort("80", "tcp", "public", True, False))
+    rich_rules.append(RichRule('rule service name="http" accept'))
+
+    assert zone.interfaces == ("eth0",)
+    assert zone.sources == ("192.0.2.0/24",)
+    assert zone.services == ("ssh",)
+    assert zone.ports == (FirewallPort("22", "tcp", "public", True, False),)
+    assert zone.rich_rules == (RichRule('rule service name="ssh" accept'),)
+    assert all(isinstance(value, tuple) for value in (zone.interfaces, zone.sources, zone.services, zone.ports, zone.rich_rules))
+
+
+def test_snapshot_copies_mutable_collections():
+    runtime_zones = [ZoneState("public")]
+    permanent_zones = [ZoneState("internal")]
+    services = ["ssh"]
+
+    snapshot = FirewallSnapshot("web01", "Fedora", True, "2.1.0", "public", runtime_zones, permanent_zones, services)
+    runtime_zones.append(ZoneState("trusted"))
+    permanent_zones.append(ZoneState("dmz"))
+    services.append("http")
+
+    assert snapshot.runtime_zones == (ZoneState("public"),)
+    assert snapshot.permanent_zones == (ZoneState("internal"),)
+    assert snapshot.available_services == ("ssh",)
+    assert all(isinstance(value, tuple) for value in (snapshot.runtime_zones, snapshot.permanent_zones, snapshot.available_services))

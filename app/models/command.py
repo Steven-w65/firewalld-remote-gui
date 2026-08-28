@@ -9,6 +9,9 @@ class CommandSpec:
     argv: tuple[str, ...]
     requires_privilege: bool = True
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "argv", tuple(self.argv))
+
 
 @dataclass(frozen=True, slots=True)
 class CommandResult:
