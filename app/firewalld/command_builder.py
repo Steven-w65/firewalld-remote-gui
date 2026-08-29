@@ -50,13 +50,13 @@ class FirewalldCommandBuilder:
     def list_active_zones() -> CommandSpec:
         return CommandSpec("list_active_zones", ("firewall-cmd", "--get-active-zones"))
 
-    @classmethod
-    def get_default_zone(cls, permanent: bool = False) -> CommandSpec:
-        return cls._spec("get_default_zone", ("--get-default-zone",), permanent)
+    @staticmethod
+    def get_default_zone() -> CommandSpec:
+        return CommandSpec("get_default_zone", ("firewall-cmd", "--get-default-zone"))
 
     @classmethod
-    def set_default_zone(cls, zone: str, permanent: bool = False) -> CommandSpec:
-        return cls._spec("set_default_zone", (f"--set-default-zone={cls._zone(zone)}",), permanent)
+    def set_default_zone(cls, zone: str) -> CommandSpec:
+        return CommandSpec("set_default_zone", ("firewall-cmd", f"--set-default-zone={cls._zone(zone)}"))
 
     @classmethod
     def get_zone_details(cls, zone: str, permanent: bool = False) -> CommandSpec:

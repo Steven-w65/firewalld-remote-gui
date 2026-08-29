@@ -11,7 +11,7 @@ _PORT_PATTERN = re.compile(r"([0-9]{1,5})(?:-([0-9]{1,5}))?\Z", re.ASCII)
 _PROTOCOLS = frozenset({"tcp", "udp"})
 _RICH_ACTIONS = frozenset({"accept", "reject", "drop"})
 _INVENTORY_LABELS = frozenset({"zone", "service", "interface"})
-_INVENTORY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z", re.ASCII)
+_ZONE_SERVICE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z", re.ASCII)
 
 
 def _text(value: str, field: str) -> str:
@@ -51,8 +51,20 @@ def validate_inventory_value(kind: str, value: str, allowed: Collection[str]) ->
 def validate_inventory_token(kind: str, value: str) -> str:
     """Validate an inventory-shaped value before a remote inventory is available."""
     label = kind if kind in _INVENTORY_LABELS else "inventory value"
-    value = _text(value, label)
-    if _INVENTORY_TOKEN_PATTERN.fullmatch(value) is None:
+    if kind not in _INVENTORY_LABELS:
+        raise InvalidFirewallArgumentError(label, "has an unsupported kind")
+    if kind in {"zone", "service"}:
+        value = _text(value, label)
+        if _ZONE_SERVICE_TOKEN_PATTERN.fullmatch(value) is not None:
+            return value
+        raise InvalidFirewallArgumentError(label, "contains unsupported characters")
+    if not isinstance(value, str) or not value:
+        raise InvalidFirewallArgumentError(label, "must be a non-empty interface name")
+    if len(value) > 16:
+        raise InvalidFirewallArgumentError(label, "must be at most 16 characters")
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        raise InvalidFirewallArgumentError(label, "must not contain whitespace or control characters")
+    if any(character in "/!*" for character in value):
         raise InvalidFirewallArgumentError(label, "contains unsupported characters")
     return value
 

@@ -1,6 +1,7 @@
 import pytest
 
 from app.firewalld.command_builder import FirewalldCommandBuilder as Builder
+from app.firewalld.renderer import render_command
 from app.utils.errors import InvalidFirewallArgumentError
 
 
@@ -12,10 +13,8 @@ from app.utils.errors import InvalidFirewallArgumentError
         ("list_zones", (False,), ("firewall-cmd", "--get-zones")),
         ("list_zones", (True,), ("firewall-cmd", "--permanent", "--get-zones")),
         ("list_active_zones", (), ("firewall-cmd", "--get-active-zones")),
-        ("get_default_zone", (False,), ("firewall-cmd", "--get-default-zone")),
-        ("get_default_zone", (True,), ("firewall-cmd", "--permanent", "--get-default-zone")),
-        ("set_default_zone", ("public", False), ("firewall-cmd", "--set-default-zone=public")),
-        ("set_default_zone", ("public", True), ("firewall-cmd", "--permanent", "--set-default-zone=public")),
+        ("get_default_zone", (), ("firewall-cmd", "--get-default-zone")),
+        ("set_default_zone", ("public",), ("firewall-cmd", "--set-default-zone=public")),
         ("get_zone_details", ("public", False), ("firewall-cmd", "--zone=public", "--list-all")),
         ("get_zone_details", ("public", True), ("firewall-cmd", "--permanent", "--zone=public", "--list-all")),
         ("list_ports", ("public", False), ("firewall-cmd", "--zone=public", "--list-ports")),
@@ -32,6 +31,18 @@ from app.utils.errors import InvalidFirewallArgumentError
 )
 def test_read_and_fixed_operations_have_exact_allowlisted_arguments(method, arguments, expected):
     assert getattr(Builder, method)(*arguments).argv == expected
+
+
+def test_default_zone_operations_are_global_and_do_not_accept_a_target():
+    get_default = Builder.get_default_zone()
+    set_default = Builder.set_default_zone("public")
+
+    assert get_default.operation == "get_default_zone"
+    assert set_default.operation == "set_default_zone"
+    with pytest.raises(TypeError):
+        Builder.get_default_zone(permanent=True)
+    with pytest.raises(TypeError):
+        Builder.set_default_zone("public", permanent=True)
 
 
 @pytest.mark.parametrize(
@@ -51,6 +62,13 @@ def test_read_and_fixed_operations_have_exact_allowlisted_arguments(method, argu
 )
 def test_mutating_operations_have_exact_runtime_and_permanent_arguments(method, arguments, expected):
     assert getattr(Builder, method)(*arguments).argv == expected
+
+
+def test_interface_builder_accepts_valid_punctuation_and_renderer_quotes_it():
+    spec = Builder.change_interface_zone("br+0#x=lab@z", "public")
+
+    assert spec.argv == ("firewall-cmd", "--zone=public", "--change-interface=br+0#x=lab@z")
+    assert render_command(spec) == "firewall-cmd --zone=public '--change-interface=br+0#x=lab@z'"
 
 
 def test_structured_rich_service_rule_has_deterministic_clauses():
@@ -81,7 +99,9 @@ def test_structured_rich_port_rule_chooses_ipv6_and_is_removable():
         lambda: Builder.add_port("public; id", "22", "tcp", False),
         lambda: Builder.add_service("public", "ssh; id", False),
         lambda: Builder.change_interface_zone("eth0; id", "public", False),
-        lambda: Builder.set_default_zone("--zone=trusted", False),
+        lambda: Builder.change_interface_zone("eth0/1", "public", False),
+        lambda: Builder.change_interface_zone("abcdefghijklmnopq", "public", False),
+        lambda: Builder.set_default_zone("trusted;id"),
         lambda: Builder.add_rich_rule("public", "192.0.2.0/24;id", None, "ssh", None, None, "accept", False),
     ],
 )

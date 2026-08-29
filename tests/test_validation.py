@@ -63,13 +63,38 @@ def test_inventory_value_must_come_from_remote_inventory():
         validate_inventory_value("zone", " public", {"public"})
 
 
-@pytest.mark.parametrize("kind, value", [("zone", "public"), ("service", "RH-Satellite-6"), ("interface", "br-0.1:2")])
-def test_inventory_tokens_are_safe_before_live_inventory_is_available(kind, value):
+@pytest.mark.parametrize(
+    "kind, value",
+    [
+        ("zone", "public_zone-2"),
+        ("service", "RH-Satellite-6"),
+        ("interface", "br-0.1:2"),
+        ("interface", "br+0#x=lab@z"),
+        ("interface", "abcdefghijklmnop"),
+    ],
+)
+def test_inventory_tokens_accept_their_kind_specific_valid_boundaries(kind, value):
     assert validate_inventory_token(kind, value) == value
 
 
-@pytest.mark.parametrize("kind, value", [("zone", "public;id"), ("service", "ssh$(id)"), ("interface", "eth0/../../x"), ("zone", "--trusted")])
-def test_inventory_token_validator_rejects_shell_or_option_shaped_values(kind, value):
+@pytest.mark.parametrize(
+    "kind, value",
+    [
+        ("zone", "public;id"),
+        ("zone", "public.zone"),
+        ("zone", "trusted*zone"),
+        ("service", "ssh$(id)"),
+        ("service", "web+api"),
+        ("interface", "eth0/../../x"),
+        ("interface", "eth!0"),
+        ("interface", "eth*0"),
+        ("interface", "eth 0"),
+        ("interface", "eth\x00"),
+        ("interface", "eth\n0"),
+        ("interface", "abcdefghijklmnopq"),
+    ],
+)
+def test_inventory_token_validator_rejects_kind_specific_invalid_boundaries(kind, value):
     with pytest.raises(InvalidFirewallArgumentError):
         validate_inventory_token(kind, value)
 
