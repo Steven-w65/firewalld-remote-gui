@@ -88,6 +88,17 @@ class UnsupportedFirewalldFeatureError(FirewallCommandError):
         )
 
 
+class SystemProbeError(RuntimeError):
+    """Raised when an approved fixed system identity probe fails safely."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        super().__init__(
+            f"System probe '{operation}' failed for server '{server_id}'."
+        )
+
+
 class HostKeyStoreError(RuntimeError):
     """Raised when the application trusted-host file cannot be handled safely."""
 

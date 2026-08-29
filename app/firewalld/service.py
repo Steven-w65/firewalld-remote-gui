@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -23,6 +24,7 @@ from app.utils.errors import (
     FirewalldNotRunningError,
     InvalidFirewallArgumentError,
     PermissionDeniedError,
+    SystemProbeError,
     UnsupportedFirewalldFeatureError,
 )
 
@@ -63,25 +65,46 @@ class ConnectionTestResult:
         object.__setattr__(self, "checks", tuple(self.checks))
 
 
-_FAILURE_MARKERS: tuple[
-    tuple[type[FirewallCommandError], tuple[str, ...]], ...
+_FIREWALL_FAILURE_RULES: tuple[
+    tuple[type[FirewallCommandError], tuple[str, ...], tuple[re.Pattern[str], ...]], ...
 ] = (
     (
         FirewalldNotInstalledError,
         ("command not found", "firewall-cmd: not found", "no such file or directory"),
+        (),
     ),
-    (FirewalldNotRunningError, ("firewalld is not running", "firewalld not running")),
+    (
+        FirewalldNotRunningError,
+        ("firewalld is not running", "firewalld not running"),
+        (),
+    ),
     (
         PermissionDeniedError,
-        ("permission denied", "not authorized", "authorization failed"),
+        (
+            "permission denied",
+            "not authorized",
+            "authorization failed",
+            "not in the sudoers file",
+            "is not allowed to execute",
+            "may not run sudo",
+        ),
+        (),
     ),
     (
         UnsupportedFirewalldFeatureError,
-        ("unrecognized arguments", "unknown option", "invalid option", "not a valid option"),
+        (
+            "unrecognized arguments",
+            "unknown option",
+            "invalid option",
+            "not a valid option",
+            "no such option",
+        ),
+        (re.compile(r"\boption\b[^\r\n]{0,120}\bnot recognized\b"),),
     ),
 )
 
-_PARTIAL_READ_ERRORS = (FirewallCommandError, FirewallParseError)
+_CONNECTION_PROBE_ERRORS = (FirewallCommandError, FirewallParseError, SystemProbeError)
+_TERMINAL_FIREWALL_ERRORS = (FirewalldNotInstalledError, FirewalldNotRunningError)
 
 
 class FirewalldService:
@@ -100,18 +123,27 @@ class FirewalldService:
         if not isinstance(result, CommandResult):
             raise TypeError("executor must return CommandResult")
         if result.operation != spec.operation or result.server_id != self._server_id:
-            raise FirewallCommandError(self._server_id, spec.operation)
+            raise self._generic_command_error(spec)
         if result.success and result.exit_code == 0:
             return result
-        self._raise_classified(spec.operation, result)
+        self._raise_classified(spec, result)
         raise AssertionError("unreachable")
 
-    def _raise_classified(self, operation: str, result: CommandResult) -> None:
+    def _generic_command_error(self, spec: CommandSpec) -> RuntimeError:
+        if spec.argv and spec.argv[0] == "firewall-cmd":
+            return FirewallCommandError(self._server_id, spec.operation)
+        return SystemProbeError(self._server_id, spec.operation)
+
+    def _raise_classified(self, spec: CommandSpec, result: CommandResult) -> None:
+        if not spec.argv or spec.argv[0] != "firewall-cmd":
+            raise SystemProbeError(self._server_id, spec.operation)
         output = f"{result.stdout}\n{result.stderr}".casefold()
-        for error_type, markers in _FAILURE_MARKERS:
-            if any(marker in output for marker in markers):
-                raise error_type(self._server_id, operation)
-        raise FirewallCommandError(self._server_id, operation)
+        for error_type, markers, patterns in _FIREWALL_FAILURE_RULES:
+            if any(marker in output for marker in markers) or any(
+                pattern.search(output) is not None for pattern in patterns
+            ):
+                raise error_type(self._server_id, spec.operation)
+        raise FirewallCommandError(self._server_id, spec.operation)
 
     @staticmethod
     def _single_word(output: str, operation: str) -> str:
@@ -128,6 +160,18 @@ class FirewalldService:
         return int(value)
 
     def detect(self, *, sudo_password: str | None = None) -> FirewalldInfo:
+        info = self._detect_state(sudo_password)
+        if not info.running:
+            return info
+        try:
+            version = self._read_version(sudo_password)
+        except _TERMINAL_FIREWALL_ERRORS:
+            raise
+        except (FirewallCommandError, FirewallParseError):
+            version = None
+        return FirewalldInfo(installed=True, running=True, version=version)
+
+    def _detect_state(self, sudo_password: str | None) -> FirewalldInfo:
         try:
             state_result = self._execute(
                 FirewalldCommandBuilder.get_state(), sudo_password
@@ -142,11 +186,13 @@ class FirewalldService:
             return FirewalldInfo(installed=True, running=False, version=None)
         if state != "running":
             raise FirewallParseError("word list", "daemon state was invalid")
+        return FirewalldInfo(installed=True, running=True, version=None)
+
+    def _read_version(self, sudo_password: str | None) -> str:
         version_result = self._execute(
             FirewalldCommandBuilder.get_version(), sudo_password
         )
-        version = self._single_word(version_result.stdout, "firewalld version")
-        return FirewalldInfo(installed=True, running=True, version=version)
+        return self._single_word(version_result.stdout, "firewalld version")
 
     def list_ports(
         self,
@@ -230,7 +276,7 @@ class FirewalldService:
                     "hostname", True, "Remote hostname read successfully."
                 )
             )
-        except _PARTIAL_READ_ERRORS:
+        except _CONNECTION_PROBE_ERRORS:
             hostname = None
             checks.append(
                 ConnectionCheck("hostname", False, "Unable to read remote hostname.")
@@ -246,7 +292,7 @@ class FirewalldService:
                     "distribution", True, "Remote distribution read successfully."
                 )
             )
-        except _PARTIAL_READ_ERRORS:
+        except _CONNECTION_PROBE_ERRORS:
             distribution = None
             checks.append(
                 ConnectionCheck(
@@ -264,7 +310,7 @@ class FirewalldService:
                     "effective_uid", True, "Remote effective UID read successfully."
                 )
             )
-        except _PARTIAL_READ_ERRORS:
+        except _CONNECTION_PROBE_ERRORS:
             effective_uid = None
             checks.append(
                 ConnectionCheck(
@@ -273,7 +319,20 @@ class FirewalldService:
             )
 
         try:
-            firewalld = self.detect(sudo_password=sudo_password)
+            firewalld = self._detect_state(sudo_password)
+        except (FirewallCommandError, FirewallParseError):
+            firewalld = FirewalldInfo(installed=True, running=False, version=None)
+            checks.append(
+                ConnectionCheck(
+                    "firewalld_state", False, "Unable to inspect firewalld state."
+                )
+            )
+            checks.append(
+                ConnectionCheck(
+                    "firewalld_version", False, "Firewalld version was not checked."
+                )
+            )
+        else:
             if not firewalld.installed:
                 firewalld_message = "Firewalld is not installed."
             elif not firewalld.running:
@@ -282,14 +341,40 @@ class FirewalldService:
                 firewalld_message = "Firewalld is running."
             checks.append(
                 ConnectionCheck(
-                    "firewalld", firewalld.running, firewalld_message
+                    "firewalld_state", firewalld.running, firewalld_message
                 )
             )
-        except _PARTIAL_READ_ERRORS:
-            firewalld = FirewalldInfo(installed=True, running=False, version=None)
-            checks.append(
-                ConnectionCheck("firewalld", False, "Unable to inspect firewalld.")
-            )
+            if not firewalld.running:
+                checks.append(
+                    ConnectionCheck(
+                        "firewalld_version",
+                        False,
+                        "Firewalld version was not checked.",
+                    )
+                )
+            else:
+                try:
+                    version = self._read_version(sudo_password)
+                except _TERMINAL_FIREWALL_ERRORS:
+                    raise
+                except (FirewallCommandError, FirewallParseError):
+                    firewalld = FirewalldInfo(True, True, None)
+                    checks.append(
+                        ConnectionCheck(
+                            "firewalld_version",
+                            False,
+                            "Unable to read firewalld version.",
+                        )
+                    )
+                else:
+                    firewalld = FirewalldInfo(True, True, version)
+                    checks.append(
+                        ConnectionCheck(
+                            "firewalld_version",
+                            True,
+                            "Firewalld version read successfully.",
+                        )
+                    )
 
         return ConnectionTestResult(
             hostname=hostname,
@@ -325,7 +410,9 @@ class FirewalldService:
                 FirewalldCommandBuilder.list_active_zones(), sudo_password
             )
             active_zones = parse_active_zones(active_result.stdout)
-        except _PARTIAL_READ_ERRORS:
+        except _TERMINAL_FIREWALL_ERRORS:
+            raise
+        except (FirewallCommandError, FirewallParseError):
             active_zones = {}
             stale = True
 
@@ -345,7 +432,9 @@ class FirewalldService:
             available_services = self.list_available_services(
                 sudo_password=sudo_password
             )
-        except _PARTIAL_READ_ERRORS:
+        except _TERMINAL_FIREWALL_ERRORS:
+            raise
+        except (FirewallCommandError, FirewallParseError):
             available_services = ()
             stale = True
 
@@ -372,7 +461,9 @@ class FirewalldService:
             names = self.list_zones(
                 permanent=permanent, sudo_password=sudo_password
             )
-        except _PARTIAL_READ_ERRORS:
+        except _TERMINAL_FIREWALL_ERRORS:
+            raise
+        except (FirewallCommandError, FirewallParseError):
             return (), True
 
         zones: list[ZoneState] = []
@@ -386,6 +477,8 @@ class FirewalldService:
                 if not permanent and active_interfaces:
                     zone = replace(zone, interfaces=active_interfaces)
                 zones.append(zone)
+            except _TERMINAL_FIREWALL_ERRORS:
+                raise
             except (
                 FirewallCommandError,
                 FirewallParseError,

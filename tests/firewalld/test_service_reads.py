@@ -9,6 +9,7 @@ from app.firewalld.service import (
     FirewalldInfo,
     FirewalldService,
 )
+from app.firewalld.system_commands import SystemCommandBuilder
 from app.ssh.host_keys import HostKeyChallenge
 from app.utils.errors import (
     CommandTimeoutError,
@@ -18,6 +19,7 @@ from app.utils.errors import (
     PermissionDeniedError,
     SSHAuthenticationError,
     SudoAuthenticationRequiredError,
+    SystemProbeError,
     UnknownHostKeyError,
     UnsupportedFirewalldFeatureError,
 )
@@ -31,6 +33,39 @@ from tests.firewalld.fakes import (
 @pytest.fixture
 def scripted_executor() -> ScriptedExecutor:
     return ScriptedExecutor()
+
+
+def _install_snapshot_prefix_with_terminal_failure(
+    executor: ScriptedExecutor,
+    failing_operation: str,
+    stderr: str,
+) -> None:
+    executor.respond("hostname", stdout="web01\n")
+    executor.respond("distribution", stdout="NAME=Fedora\n")
+    executor.respond("get_state", stdout="running\n")
+    executor.respond("get_version", stdout="2.3.1\n")
+    executor.respond("get_default_zone", stdout="public\n")
+    if failing_operation == "list_active_zones":
+        executor.respond(failing_operation, exit_code=1, stderr=stderr)
+        return
+    executor.respond("list_active_zones", stdout="public\n  interfaces: eth0\n")
+    if failing_operation == "list_zones_runtime":
+        executor.respond(failing_operation, exit_code=1, stderr=stderr)
+        return
+    executor.respond("list_zones_runtime", stdout="public\n")
+    if failing_operation == "get_zone_details_runtime":
+        executor.respond(failing_operation, exit_code=1, stderr=stderr)
+        return
+    executor.respond("get_zone_details_runtime", stdout=zone_output("public"))
+    if failing_operation == "list_zones_permanent":
+        executor.respond(failing_operation, exit_code=1, stderr=stderr)
+        return
+    executor.respond("list_zones_permanent", stdout="public\n")
+    if failing_operation == "get_zone_details_permanent":
+        executor.respond(failing_operation, exit_code=1, stderr=stderr)
+        return
+    executor.respond("get_zone_details_permanent", stdout=zone_output("public"))
+    executor.respond(failing_operation, exit_code=1, stderr=stderr)
 
 
 def test_result_records_are_frozen_slotted_and_normalize_check_sequences():
@@ -77,26 +112,80 @@ def test_detection_distinguishes_missing_and_stopped_without_requesting_version(
 
 
 @pytest.mark.parametrize(
-    ("stderr", "error_type"),
+    ("stdout", "stderr", "error_type"),
     [
-        ("firewall-cmd: command not found", FirewalldNotInstalledError),
-        ("FirewallD is not running", FirewalldNotRunningError),
-        ("Authorization failed: permission denied", PermissionDeniedError),
-        ("firewall-cmd: error: unrecognized arguments: --get-services", UnsupportedFirewalldFeatureError),
-        ("ERROR: an ordinary remote failure", FirewallCommandError),
+        ("firewall-cmd: command not found", "", FirewalldNotInstalledError),
+        ("", "FirewallD is not running", FirewalldNotRunningError),
+        ("Authorization failed: permission denied", "", PermissionDeniedError),
+        ("", "alice is not in the sudoers file.", PermissionDeniedError),
+        ("ALICE IS NOT ALLOWED TO EXECUTE firewall-cmd", "", PermissionDeniedError),
+        ("", "alice may not run sudo on web01", PermissionDeniedError),
+        ("firewall-cmd: no such option: --future", "", UnsupportedFirewalldFeatureError),
+        ("", "firewall-cmd: option '--future' not recognized", UnsupportedFirewalldFeatureError),
+        (
+            "firewall-cmd: no such option: --future",
+            "permission denied",
+            PermissionDeniedError,
+        ),
+        (
+            "firewall-cmd: command not found",
+            "permission denied",
+            FirewalldNotInstalledError,
+        ),
+        ("", "ERROR: an ordinary remote failure", FirewallCommandError),
     ],
 )
 def test_failed_read_results_are_centrally_classified_into_safe_typed_errors(
-    scripted_executor, stderr, error_type
+    scripted_executor, stdout, stderr, error_type
 ):
-    scripted_executor.respond("list_available_services", exit_code=1, stderr=stderr)
+    scripted_executor.respond(
+        "list_available_services",
+        exit_code=1,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
     with pytest.raises(error_type) as error:
         FirewalldService(scripted_executor, "web01").list_available_services()
 
     assert error.value.operation == "list_available_services"
     assert error.value.server_id == "web01"
-    assert stderr not in str(error.value)
+    if stdout:
+        assert stdout not in str(error.value)
+    if stderr:
+        assert stderr not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("spec", "stdout", "stderr"),
+    [
+        (SystemCommandBuilder.hostname(), "hostname: command not found", ""),
+        (
+            SystemCommandBuilder.distribution(),
+            "",
+            "cat: /etc/os-release: No such file or directory",
+        ),
+        (SystemCommandBuilder.effective_uid(), "id: command not found", ""),
+    ],
+)
+def test_system_probe_failures_never_use_firewalld_error_categories(
+    scripted_executor, spec, stdout, stderr
+):
+    scripted_executor.respond(
+        spec.operation,
+        exit_code=1,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    with pytest.raises(SystemProbeError) as error:
+        FirewalldService(scripted_executor, "web01")._execute(spec, None)
+
+    assert not isinstance(error.value, FirewalldNotInstalledError)
+    if stdout:
+        assert stdout not in str(error.value)
+    if stderr:
+        assert stderr not in str(error.value)
 
 
 def test_classified_error_does_not_leak_credentials_or_raw_output_through_exception_chain(
@@ -189,7 +278,10 @@ def test_connection_test_returns_fixed_named_checks_and_uses_read_only_probes(sc
             ConnectionCheck("hostname", True, "Remote hostname read successfully."),
             ConnectionCheck("distribution", True, "Remote distribution read successfully."),
             ConnectionCheck("effective_uid", True, "Remote effective UID read successfully."),
-            ConnectionCheck("firewalld", True, "Firewalld is running."),
+            ConnectionCheck("firewalld_state", True, "Firewalld is running."),
+            ConnectionCheck(
+                "firewalld_version", True, "Firewalld version read successfully."
+            ),
         ),
     )
     assert [call.spec.operation for call in scripted_executor.calls] == [
@@ -225,7 +317,12 @@ def test_connection_test_has_fixed_missing_and_stopped_firewalld_messages(
     result = FirewalldService(scripted_executor, "web01").connection_test()
 
     assert result.firewalld == info
-    assert result.checks[-1] == ConnectionCheck("firewalld", False, message)
+    assert result.checks[-2:] == (
+        ConnectionCheck("firewalld_state", False, message),
+        ConnectionCheck(
+            "firewalld_version", False, "Firewalld version was not checked."
+        ),
+    )
     scripted_executor.assert_exhausted()
 
 
@@ -245,7 +342,12 @@ def test_connection_test_records_safe_failures_but_continues_fixed_probes(script
         ConnectionCheck("hostname", False, "Unable to read remote hostname."),
         ConnectionCheck("distribution", True, "Remote distribution read successfully."),
         ConnectionCheck("effective_uid", False, "Unable to read remote effective UID."),
-        ConnectionCheck("firewalld", False, "Unable to inspect firewalld."),
+        ConnectionCheck(
+            "firewalld_state", False, "Unable to inspect firewalld state."
+        ),
+        ConnectionCheck(
+            "firewalld_version", False, "Firewalld version was not checked."
+        ),
     )
     assert "secret" not in repr(result)
     scripted_executor.assert_exhausted()
@@ -329,6 +431,107 @@ def test_snapshot_requires_an_installed_running_daemon(scripted_executor, stderr
     scripted_executor.respond("hostname", stdout="web01\n")
     scripted_executor.respond("distribution", stdout="NAME=Fedora\n")
     scripted_executor.respond("get_state", exit_code=1, stderr=stderr)
+
+    with pytest.raises(error_type):
+        FirewalldService(scripted_executor, "web01").load_snapshot()
+
+    scripted_executor.assert_exhausted()
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stdout", "stderr"),
+    [
+        (1, "", "permission denied"),
+        (2, "", "firewall-cmd: no such option: --version"),
+        (1, "", "ordinary version failure"),
+        (0, "", ""),
+    ],
+)
+def test_detection_preserves_running_state_when_nonterminal_version_read_fails(
+    scripted_executor, exit_code, stdout, stderr
+):
+    scripted_executor.respond("get_state", stdout="running\n")
+    scripted_executor.respond(
+        "get_version",
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    info = FirewalldService(scripted_executor, "web01").detect()
+
+    assert info == FirewalldInfo(installed=True, running=True, version=None)
+    scripted_executor.assert_exhausted()
+
+
+@pytest.mark.parametrize(
+    ("stderr", "error_type"),
+    [
+        ("firewall-cmd: command not found", FirewalldNotInstalledError),
+        ("FirewallD is not running", FirewalldNotRunningError),
+    ],
+)
+def test_detection_propagates_terminal_version_failure_after_running_state(
+    scripted_executor, stderr, error_type
+):
+    scripted_executor.respond("get_state", stdout="running\n")
+    scripted_executor.respond("get_version", exit_code=1, stderr=stderr)
+
+    with pytest.raises(error_type):
+        FirewalldService(scripted_executor, "web01").detect()
+
+    scripted_executor.assert_exhausted()
+
+
+def test_connection_test_preserves_running_info_when_version_probe_fails(scripted_executor):
+    scripted_executor.respond("hostname", stdout="web01\n")
+    scripted_executor.respond("distribution", stdout="NAME=Fedora\n")
+    scripted_executor.respond("effective_uid", stdout="1000\n")
+    scripted_executor.respond("get_state", stdout="running\n")
+    scripted_executor.respond(
+        "get_version",
+        exit_code=2,
+        stderr="firewall-cmd: option '--version' not recognized",
+    )
+
+    result = FirewalldService(scripted_executor, "web01").connection_test()
+
+    assert result.firewalld == FirewalldInfo(True, True, None)
+    assert result.checks[-2:] == (
+        ConnectionCheck("firewalld_state", True, "Firewalld is running."),
+        ConnectionCheck(
+            "firewalld_version", False, "Unable to read firewalld version."
+        ),
+    )
+    scripted_executor.assert_exhausted()
+
+
+@pytest.mark.parametrize(
+    "failing_operation",
+    [
+        "list_active_zones",
+        "list_zones_runtime",
+        "get_zone_details_runtime",
+        "list_zones_permanent",
+        "get_zone_details_permanent",
+        "list_available_services",
+    ],
+)
+@pytest.mark.parametrize(
+    ("stderr", "error_type"),
+    [
+        ("firewall-cmd: command not found", FirewalldNotInstalledError),
+        ("FirewallD is not running", FirewalldNotRunningError),
+    ],
+)
+def test_snapshot_propagates_terminal_firewalld_changes_from_every_partial_read_area(
+    scripted_executor, failing_operation, stderr, error_type
+):
+    _install_snapshot_prefix_with_terminal_failure(
+        scripted_executor,
+        failing_operation,
+        stderr,
+    )
 
     with pytest.raises(error_type):
         FirewalldService(scripted_executor, "web01").load_snapshot()
