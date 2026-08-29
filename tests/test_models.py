@@ -126,6 +126,15 @@ def test_zone_state_accepts_an_explicit_frozen_permanent_state():
         zone.permanent = False
 
 
+def test_zone_state_copies_read_side_protocols_into_an_immutable_tuple():
+    protocols = ["icmp", "17"]
+
+    zone = ZoneState("public", protocols=protocols)
+    protocols.append("gre")
+
+    assert zone.protocols == ("icmp", "17")
+
+
 def test_snapshot_copies_mutable_collections():
     runtime_zones = [ZoneState("public")]
     permanent_zones = [ZoneState("internal")]

@@ -50,6 +50,7 @@ class ZoneState:
     masquerade: bool = False
     forwarding: bool = False
     permanent: bool = False
+    protocols: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "interfaces", tuple(self.interfaces))
@@ -57,6 +58,7 @@ class ZoneState:
         object.__setattr__(self, "services", tuple(self.services))
         object.__setattr__(self, "ports", tuple(self.ports))
         object.__setattr__(self, "rich_rules", tuple(self.rich_rules))
+        object.__setattr__(self, "protocols", tuple(self.protocols))
 
 
 @dataclass(frozen=True, slots=True)

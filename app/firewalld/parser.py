@@ -6,23 +6,44 @@ import re
 
 from app.models.firewall import FirewallPort, RichRule, ZoneState
 from app.utils.errors import FirewallParseError, InvalidFirewallArgumentError
-from app.utils.validation import validate_ip_network, validate_port, validate_protocol, validate_rich_action
+from app.utils.validation import (
+    validate_inventory_token,
+    validate_ip_network,
+    validate_port,
+    validate_rich_action,
+)
 
 
 _ZONE_LIST_FIELDS = frozenset({"interfaces", "sources", "services", "ports", "protocols"})
 _ZONE_BOOLEAN_FIELDS = frozenset({"forward", "masquerade"})
-_ZONE_OTHER_FIELDS = frozenset({"target", "icmp-block-inversion", "forward-ports", "source-ports", "icmp-blocks"})
+_ZONE_OTHER_FIELDS = frozenset(
+    {
+        "target",
+        "icmp-block-inversion",
+        "ingress-priority",
+        "egress-priority",
+        "forward-ports",
+        "source-ports",
+        "icmp-blocks",
+    }
+)
+_ZONE_MULTILINE_FIELDS = frozenset({"forward-ports", "source-ports", "icmp-blocks"})
 _ZONE_REQUIRED_FIELDS = _ZONE_LIST_FIELDS | _ZONE_BOOLEAN_FIELDS | frozenset({"rich rules"})
-_RICH_PATTERN = re.compile(r"^rule(?:\s|$)")
-_RICH_CLAUSES = {
-    "family": re.compile(r'(?:^|\s)family="([^"]*)"(?:\s|$)'),
-    "source": re.compile(r'(?:^|\s)source\s+address="([^"]*)"(?:\s|$)'),
-    "destination": re.compile(r'(?:^|\s)destination\s+address="([^"]*)"(?:\s|$)'),
-    "service": re.compile(r'(?:^|\s)service\s+name="([^"]*)"(?:\s|$)'),
-    "port": re.compile(r'(?:^|\s)port\s+port="([^"]*)"(?:\s|$)'),
-    "protocol": re.compile(r'(?:^|\s)protocol(?:\s+value)?="([^"]*)"(?:\s|$)'),
-}
-_RICH_ACTION = re.compile(r"(?:^|\s)(accept|reject|drop)(?:\s|$)", re.IGNORECASE)
+_PORT_PROTOCOLS = frozenset({"tcp", "udp", "sctp", "dccp"})
+_READ_PROTOCOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{0,63}\Z", re.ASCII)
+_MAC_ADDRESS = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z", re.ASCII)
+_IPSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z", re.ASCII)
+_RICH_RULE = re.compile(
+    r'^rule'
+    r'(?: family="(?P<family>[^"]*)")?'
+    r'(?: source address="(?P<source>[^"]*)")?'
+    r'(?: destination address="(?P<destination>[^"]*)")?'
+    r'(?: service name="(?P<service>[^"]*)"'
+    r'| port port="(?P<port>[^"]*)" protocol="(?P<port_protocol>[^"]*)"'
+    r'| protocol value="(?P<protocol>[^"]*)")'
+    r' (?P<action>accept|reject|drop)$',
+    re.IGNORECASE | re.ASCII,
+)
 
 
 def _fail(operation: str, reason: str) -> None:
@@ -34,6 +55,42 @@ def _validated(operation: str, validator, value: str, reason: str) -> str:
         return validator(value)
     except InvalidFirewallArgumentError:
         _fail(operation, reason)
+    raise AssertionError("unreachable")
+
+
+def _read_token(value: str, operation: str, reason: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip() or any(character.isspace() for character in value):
+        _fail(operation, reason)
+    return value
+
+
+def _parse_port_protocol(value: str, operation: str) -> str:
+    normalized = _read_token(value, operation, "invalid port protocol").lower()
+    if normalized not in _PORT_PROTOCOLS:
+        _fail(operation, "invalid port protocol")
+    return normalized
+
+
+def _parse_read_protocol(value: str, operation: str) -> str:
+    value = _read_token(value, operation, "invalid protocol value")
+    if value.isascii() and value.isdecimal():
+        if 0 <= int(value) <= 255:
+            return value
+    elif _READ_PROTOCOL_NAME.fullmatch(value) is not None:
+        return value.lower()
+    _fail(operation, "invalid protocol value")
+
+
+def _parse_zone_source(value: str) -> str:
+    value = _read_token(value, "zone state", "invalid source value")
+    if _MAC_ADDRESS.fullmatch(value) is not None:
+        return value.lower()
+    if value.startswith("ipset:") and _IPSET_NAME.fullmatch(value.removeprefix("ipset:")) is not None:
+        return value
+    try:
+        return validate_ip_network(value)
+    except InvalidFirewallArgumentError:
+        _fail("zone state", "invalid source value")
     raise AssertionError("unreachable")
 
 
@@ -87,13 +144,26 @@ def _parse_ports(value: str, name: str, permanent: bool) -> tuple[FirewallPort, 
         ports.append(
             FirewallPort(
                 _validated("zone state", validate_port, port, "invalid port value"),
-                _validated("zone state", validate_protocol, protocol, "invalid protocol value"),
+                _parse_port_protocol(protocol, "zone state"),
                 name,
                 not permanent,
                 permanent,
             )
         )
     return tuple(ports)
+
+
+def _matches_zone_header(name: str, header: str) -> bool:
+    if header == name:
+        return True
+    prefix = f"{name} ("
+    if not header.startswith(prefix) or not header.endswith(")"):
+        return False
+    annotations = tuple(part.strip() for part in header[len(prefix) : -1].split(","))
+    return bool(annotations) and len(annotations) <= 2 and len(set(annotations)) == len(annotations) and set(annotations) <= {
+        "active",
+        "default",
+    }
 
 
 def parse_zone_state(name: str, output: str, permanent: bool) -> ZoneState:
@@ -104,93 +174,100 @@ def parse_zone_state(name: str, output: str, permanent: bool) -> ZoneState:
     header_index = next((index for index, line in enumerate(lines) if line.strip()), None)
     if header_index is None:
         _fail("zone state", "missing zone header")
-    header = lines[header_index].strip()
-    header_name = header.removesuffix(" (active)")
-    if not header_name or header_name != name:
+    if not _matches_zone_header(name, lines[header_index].strip()):
         _fail("zone state", "zone header did not match")
 
     fields: dict[str, str] = {}
     rich_rule_lines: list[str] = []
-    in_rich_rules = False
+    top_level_indent: int | None = None
+    current_field: str | None = None
+    known_fields = _ZONE_LIST_FIELDS | _ZONE_BOOLEAN_FIELDS | _ZONE_OTHER_FIELDS | {"rich rules"}
     for line in lines[header_index + 1 :]:
         if not line.strip():
             continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation == 0:
+            _fail("zone state", "malformed zone field")
+        if top_level_indent is None:
+            top_level_indent = indentation
+        if indentation > top_level_indent:
+            if current_field == "rich rules":
+                rich_rule_lines.append(line)
+                continue
+            if current_field in _ZONE_MULTILINE_FIELDS:
+                continue
+            _fail("zone state", "unexpected zone field continuation")
+        if indentation != top_level_indent:
+            _fail("zone state", "malformed zone field")
         stripped = line.lstrip()
-        if in_rich_rules and _RICH_PATTERN.match(stripped):
-            rich_rule_lines.append(line)
-            continue
         if ":" not in stripped:
             _fail("zone state", "malformed zone field")
         field, value = stripped.split(":", 1)
-        if field not in _ZONE_LIST_FIELDS | _ZONE_BOOLEAN_FIELDS | _ZONE_OTHER_FIELDS | {"rich rules"}:
+        if field not in known_fields:
             _fail("zone state", "unknown zone field")
         if field in fields:
             _fail("zone state", "duplicate zone field")
         fields[field] = value
-        in_rich_rules = field == "rich rules"
+        current_field = field
     if not _ZONE_REQUIRED_FIELDS.issubset(fields):
         _fail("zone state", "required zone fields were missing")
 
-    sources = tuple(
-        _validated("zone state", validate_ip_network, source, "invalid source network")
-        for source in parse_words(fields["sources"])
-    )
-    services = parse_words(fields["services"])
-    for protocol in parse_words(fields["protocols"]):
-        _validated("zone state", validate_protocol, protocol, "invalid protocol value")
     return ZoneState(
         name=name,
         interfaces=parse_words(fields["interfaces"]),
-        sources=sources,
-        services=services,
+        sources=tuple(_parse_zone_source(source) for source in parse_words(fields["sources"])),
+        services=parse_words(fields["services"]),
         ports=_parse_ports(fields["ports"], name, permanent),
         rich_rules=parse_rich_rules("\n".join(rich_rule_lines)),
         masquerade=_parse_bool(fields["masquerade"], "zone state", "masquerade"),
         forwarding=_parse_bool(fields["forward"], "zone state", "forward"),
         permanent=permanent,
+        protocols=tuple(_parse_read_protocol(protocol, "zone state") for protocol in parse_words(fields["protocols"])),
     )
 
 
-def _single_rich_value(rule: str, field: str) -> str | None:
-    matches = _RICH_CLAUSES[field].findall(rule)
-    if len(matches) > 1:
-        _fail("rich rules", "duplicate structured clause")
-    return matches[0] if matches else None
+def _raw_rich_rule(rule: str) -> RichRule:
+    return RichRule(rule=rule)
 
 
 def parse_rich_rules(output: str) -> tuple[RichRule, ...]:
-    """Preserve raw rich-rule display lines while extracting recognized safe clauses."""
+    """Preserve rich-rule display lines and structure only the complete safe subset."""
     if not isinstance(output, str):
         _fail("rich rules", "output was not text")
     rules: list[RichRule] = []
-    for rule in output.splitlines():
-        if not rule.strip():
+    for raw_rule in output.splitlines():
+        if not raw_rule.strip():
             continue
-        if not _RICH_PATTERN.match(rule.strip()):
-            _fail("rich rules", "malformed rich rule")
-        family = _single_rich_value(rule, "family")
+        match = _RICH_RULE.fullmatch(raw_rule.strip())
+        if match is None:
+            rules.append(_raw_rich_rule(raw_rule))
+            continue
+        values = match.groupdict()
+        family = values["family"]
         if family is not None and family.lower() not in {"ipv4", "ipv6"}:
             _fail("rich rules", "invalid address family")
-        source = _single_rich_value(rule, "source")
+        source = values["source"]
+        destination = values["destination"]
+        if (source is not None or destination is not None) and family is None:
+            rules.append(_raw_rich_rule(raw_rule))
+            continue
         if source is not None:
             source = _validated("rich rules", validate_ip_network, source, "invalid source network")
-        destination = _single_rich_value(rule, "destination")
         if destination is not None:
             destination = _validated("rich rules", validate_ip_network, destination, "invalid destination network")
-        service = _single_rich_value(rule, "service")
-        port = _single_rich_value(rule, "port")
+        service = values["service"]
+        if service is not None:
+            service = _validated("rich rules", lambda value: validate_inventory_token("service", value), service, "invalid service value")
+        port = values["port"]
         if port is not None:
             port = _validated("rich rules", validate_port, port, "invalid port value")
-        protocol = _single_rich_value(rule, "protocol")
-        if protocol is not None:
-            protocol = _validated("rich rules", validate_protocol, protocol, "invalid protocol value")
-        actions = _RICH_ACTION.findall(rule)
-        if len(actions) > 1:
-            _fail("rich rules", "duplicate action")
-        action = _validated("rich rules", validate_rich_action, actions[0], "invalid action") if actions else None
+            protocol = _parse_port_protocol(values["port_protocol"], "rich rules")
+        else:
+            protocol = _parse_read_protocol(values["protocol"], "rich rules") if values["protocol"] is not None else None
+        action = _validated("rich rules", validate_rich_action, values["action"], "invalid action")
         rules.append(
             RichRule(
-                rule=rule,
+                rule=raw_rule,
                 family=family,
                 source=source,
                 destination=destination,
@@ -204,34 +281,58 @@ def parse_rich_rules(output: str) -> tuple[RichRule, ...]:
 
 
 def _decode_os_value(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
-        value = value[1:-1]
+    if not value:
+        return ""
+    if value[0] == "'":
+        if len(value) < 2 or not value.endswith("'") or "'" in value[1:-1]:
+            _fail("os release", "malformed os release value")
+        return value[1:-1]
+    if value[0] == '"':
+        decoded: list[str] = []
+        index = 1
+        while index < len(value):
+            character = value[index]
+            if character == '"':
+                if index != len(value) - 1:
+                    _fail("os release", "malformed os release value")
+                return "".join(decoded)
+            if character != "\\":
+                decoded.append(character)
+                index += 1
+                continue
+            if index + 1 == len(value):
+                _fail("os release", "malformed os release value")
+            escaped = value[index + 1]
+            if escaped in {'"', "\\", "$", "`"}:
+                decoded.append(escaped)
+            else:
+                decoded.extend(("\\", escaped))
+            index += 2
+        _fail("os release", "malformed os release value")
     decoded: list[str] = []
     index = 0
     while index < len(value):
-        if value[index] != "\\" or index + 1 == len(value):
-            decoded.append(value[index])
-            index += 1
+        character = value[index]
+        if character.isspace() or character in {'"', "'"}:
+            _fail("os release", "malformed os release value")
+        if character == "\\":
+            if index + 1 == len(value):
+                _fail("os release", "malformed os release value")
+            decoded.append(value[index + 1])
+            index += 2
             continue
-        if value[index + 1] == "x" and index + 3 < len(value):
-            hex_value = value[index + 2 : index + 4]
-            if all(character in "0123456789abcdefABCDEF" for character in hex_value):
-                decoded.append(chr(int(hex_value, 16)))
-                index += 4
-                continue
-        decoded.append(value[index + 1])
-        index += 2
+        decoded.append(character)
+        index += 1
     return "".join(decoded)
 
 
 def parse_os_release(output: str) -> str:
-    """Return PRETTY_NAME, or NAME when PRETTY_NAME is absent, from os-release text."""
+    """Return PRETTY_NAME, or NAME when PRETTY_NAME is absent, without executing text."""
     if not isinstance(output, str):
         _fail("os release", "output was not text")
     values: dict[str, str] = {}
     for line in output.splitlines():
-        if not line or line.lstrip().startswith("#") or "=" not in line:
+        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         if key in {"PRETTY_NAME", "NAME"}:

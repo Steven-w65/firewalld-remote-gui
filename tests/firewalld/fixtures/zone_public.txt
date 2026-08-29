@@ -1,16 +1,21 @@
-public (active)
+public (default, active)
   target: default
   icmp-block-inversion: no
+  ingress-priority: 0
+  egress-priority: 0
   interfaces: eth0 eth1
-  sources: 192.0.2.0/24 2001:db8::/64
+  sources: 192.0.2.0/24 2001:db8::/64 00:11:22:33:44:55 ipset:trusted_clients
   services: http https ssh
-  ports: 8000-8100/tcp 53/udp
-  protocols: tcp udp
+  ports: 8000-8100/tcp 53/udp 5000/sctp 5001/dccp
+  protocols: tcp udp icmp 17
   forward: yes
   masquerade: no
   forward-ports:
+    port=8443:proto=tcp:toport=443:toaddr=192.0.2.10
   source-ports:
+    port=1024-65535:protocol=tcp
   icmp-blocks:
+    echo-request
   rich rules:
     rule family="ipv4" source address="192.0.2.0/24" port port="8443" protocol="tcp" accept
     rule family="ipv6" destination address="2001:db8::/64" service name="ssh" reject
