@@ -30,6 +30,64 @@ class FirewallParseError(ValueError):
         super().__init__(f"Unable to parse firewalld {self.operation} output.")
 
 
+class FirewallCommandError(RuntimeError):
+    """Raised when an approved remote firewall read fails safely."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        super().__init__(
+            f"Firewalld command '{operation}' failed for server '{server_id}'."
+        )
+
+
+class FirewalldNotInstalledError(FirewallCommandError):
+    """Raised when the approved firewall executable is unavailable."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        RuntimeError.__init__(
+            self, f"Firewalld is not installed on server '{server_id}'."
+        )
+
+
+class FirewalldNotRunningError(FirewallCommandError):
+    """Raised when a read requires a running firewalld daemon."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        RuntimeError.__init__(
+            self, f"Firewalld is not running on server '{server_id}'."
+        )
+
+
+class PermissionDeniedError(FirewallCommandError):
+    """Raised when remote authorization denies an approved firewall read."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        RuntimeError.__init__(
+            self,
+            f"Permission was denied for firewalld operation '{operation}' "
+            f"on server '{server_id}'.",
+        )
+
+
+class UnsupportedFirewalldFeatureError(FirewallCommandError):
+    """Raised when the remote firewalld does not support an approved read."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        RuntimeError.__init__(
+            self,
+            f"Firewalld operation '{operation}' is unsupported on server '{server_id}'.",
+        )
+
+
 class HostKeyStoreError(RuntimeError):
     """Raised when the application trusted-host file cannot be handled safely."""
 
