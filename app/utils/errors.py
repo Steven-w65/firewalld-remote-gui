@@ -56,3 +56,84 @@ class ChangedHostKeyError(RuntimeError):
             f"SSH host key changed for {host}:{port}: expected {expected_fingerprint}; "
             f"received {actual_fingerprint}."
         )
+
+
+class InvalidHostTokenError(ValueError):
+    """Raised before an unsafe raw host token reaches known-hosts handling."""
+
+    def __init__(self) -> None:
+        super().__init__("SSH host must be a nonempty raw ASCII host token.")
+
+
+class SSHError(RuntimeError):
+    """Base class for credential-free SSH execution failures."""
+
+
+class SSHConnectionError(SSHError):
+    """Raised when an SSH connection cannot be established or used."""
+
+    def __init__(self, server_id: str, category: str = "connection failed") -> None:
+        self.server_id = server_id
+        super().__init__(f"SSH {category} for server '{server_id}'.")
+
+
+class SSHAuthenticationError(SSHConnectionError):
+    """Raised when SSH authentication fails."""
+
+    def __init__(self, server_id: str) -> None:
+        super().__init__(server_id, "authentication failed")
+
+
+class SSHConnectionTimeoutError(SSHConnectionError):
+    """Raised when establishing an SSH connection times out."""
+
+    def __init__(self, server_id: str) -> None:
+        super().__init__(server_id, "connection timed out")
+
+
+class SSHRemoteEOFError(SSHError):
+    """Raised when a remote command channel closes without an exit status."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        super().__init__(
+            f"SSH remote channel closed unexpectedly for server '{server_id}' "
+            f"during operation '{operation}'."
+        )
+
+
+class CommandTimeoutError(SSHError):
+    """Raised when a remote command exceeds its monotonic deadline."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        super().__init__(
+            f"SSH command timed out for server '{server_id}' during operation '{operation}'."
+        )
+
+
+class SudoAuthenticationRequiredError(SSHError):
+    """Raised when sudo needs a password before a command can run."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        super().__init__(
+            f"Sudo authentication is required for server '{server_id}' "
+            f"during operation '{operation}'."
+        )
+
+
+class SudoAuthenticationError(SudoAuthenticationRequiredError):
+    """Raised when a supplied sudo password is rejected."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        SSHError.__init__(
+            self,
+            f"Sudo authentication failed for server '{server_id}' "
+            f"during operation '{operation}'.",
+        )

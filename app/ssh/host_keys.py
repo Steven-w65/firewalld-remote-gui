@@ -3,13 +3,28 @@
 import base64
 import hashlib
 import os
+import string
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import paramiko
 
-from app.utils.errors import ChangedHostKeyError, HostKeyStoreError, UnknownHostKeyError
+from app.utils.errors import (
+    ChangedHostKeyError,
+    HostKeyStoreError,
+    InvalidHostTokenError,
+    UnknownHostKeyError,
+)
+
+
+_RAW_HOST_CHARACTERS = frozenset(string.ascii_letters + string.digits + "._-:%")
+
+
+def validate_host_token(host: str) -> None:
+    """Accept only portable raw host tokens, never OpenSSH host patterns."""
+    if not host or any(character not in _RAW_HOST_CHARACTERS for character in host):
+        raise InvalidHostTokenError()
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +63,7 @@ class HostKeyStore:
 
     def challenge(self, host: str, port: int, key: paramiko.PKey) -> HostKeyChallenge:
         """Build the canonical confirmation payload for a presented host key."""
+        validate_host_token(host)
         return HostKeyChallenge(
             host=host,
             port=port,
@@ -58,6 +74,7 @@ class HostKeyStore:
 
     def verify(self, host: str, port: int, key: paramiko.PKey) -> None:
         """Verify a presented key or raise a typed explicit-trust error."""
+        validate_host_token(host)
         trusted_key = self._trusted_key(host, port, key.get_name())
         if trusted_key is None:
             raise UnknownHostKeyError(self.challenge(host, port, key))
@@ -71,6 +88,7 @@ class HostKeyStore:
 
     def trust(self, challenge: HostKeyChallenge) -> None:
         """Persist an explicitly confirmed, previously unknown host key."""
+        validate_host_token(challenge.host)
         if not self._challenge_is_consistent(challenge):
             raise HostKeyStoreError()
 

@@ -11,7 +11,12 @@ import pytest
 from app.ssh import host_keys
 from app.ssh.host_keys import HostKeyChallenge, HostKeyStore
 from app.utils import errors
-from app.utils.errors import ChangedHostKeyError, HostKeyStoreError, UnknownHostKeyError
+from app.utils.errors import (
+    ChangedHostKeyError,
+    HostKeyStoreError,
+    InvalidHostTokenError,
+    UnknownHostKeyError,
+)
 
 
 def sha256_fingerprint(key: paramiko.PKey) -> str:
@@ -239,3 +244,65 @@ def test_persistence_failure_keeps_original_cleans_temp_and_hides_unsafe_details
     assert not temporary_files(known_hosts)
     assert unsafe_text not in traceback_text
     assert candidate.get_base64() not in traceback_text
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "edge.example.test",
+        "host_name-1",
+        "192.0.2.1",
+        "2001:db8::1",
+        "fe80::1%eth0",
+    ],
+)
+def test_raw_ascii_host_tokens_support_only_the_approved_portable_forms(tmp_path, host):
+    """Catches rejecting DNS, IPv4, IPv6, or scoped IPv6 tokens in the safe grammar."""
+    store = HostKeyStore(tmp_path / "known_hosts")
+    key = paramiko.RSAKey.generate(1024)
+
+    challenge = store.challenge(host, 22, key)
+
+    assert challenge.host == host
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "",
+        "[edge.example.test]",
+        "one.test,two.test",
+        "space host",
+        "line\nbreak",
+        "*.example.test",
+        "|1|hash",
+        "path/host",
+        "host@realm",
+        "h\N{LATIN SMALL LETTER O WITH DIAERESIS}st",
+    ],
+)
+def test_known_hosts_metacharacters_are_rejected_before_lookup(tmp_path, monkeypatch, host):
+    """Catches raw configuration injecting OpenSSH patterns or trust-file lines."""
+    store = HostKeyStore(tmp_path / "known_hosts")
+    key = paramiko.RSAKey.generate(1024)
+
+    def lookup_must_not_run():
+        raise AssertionError("invalid host reached known-hosts lookup")
+
+    monkeypatch.setattr(store, "load", lookup_must_not_run)
+
+    with pytest.raises(InvalidHostTokenError):
+        store.verify(host, 22, key)
+
+
+def test_invalid_challenge_host_is_rejected_before_persistence(tmp_path):
+    """Catches a tampered confirmation payload bypassing raw-host validation."""
+    known_hosts = tmp_path / "known_hosts"
+    store = HostKeyStore(known_hosts)
+    key = paramiko.RSAKey.generate(1024)
+    challenge = store.challenge("safe.test", 22, key)
+
+    with pytest.raises(InvalidHostTokenError):
+        store.trust(replace(challenge, host="safe.test,attacker.test"))
+
+    assert not known_hosts.exists()
