@@ -26,6 +26,15 @@ from app.utils.errors import (
 )
 
 
+def _encode_credential(value: str) -> bytes | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return value.encode("utf-8")
+    except UnicodeError:
+        return None
+
+
 class _ApplicationHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     """Delegate every presented host key to the application trust store."""
 
@@ -56,6 +65,10 @@ class SSHManager:
         clock: Callable[[], float] = monotonic,
         sleeper: Callable[[float], None] = sleep,
     ) -> None:
+        encoded_password = _encode_credential(server.password)
+        if encoded_password is None:
+            raise SSHAuthenticationError(server.id)
+        del encoded_password
         self._server = server
         self._host_key_store = host_key_store
         self._connect_timeout = (
@@ -171,14 +184,17 @@ class SSHManager:
             raise SSHConnectionError(self._server.id, "not connected")
 
         use_sudo = spec.requires_privilege and self._server.username != "root"
-        stdin_text: str | None = None
+        stdin_data: bytes | None = None
         if not use_sudo:
             command = render_command(spec)
         elif sudo_password is None:
             command = render_sudo(spec, "noninteractive")
         else:
+            encoded_password = _encode_credential(sudo_password)
+            if encoded_password is None:
+                raise SudoAuthenticationError(self._server.id, spec.operation)
             command = render_sudo(spec, "stdin")
-            stdin_text = f"{sudo_password}\n"
+            stdin_data = encoded_password + b"\n"
 
         output = ChannelRunner(
             transport,
@@ -187,7 +203,7 @@ class SSHManager:
             spec.operation,
             clock=self._clock,
             sleeper=self._sleeper,
-        ).run(command, stdin_text)
+        ).run(command, stdin_data)
 
         if use_sudo and output.exit_code != 0:
             markers = {line.strip() for line in output.stderr.splitlines()}

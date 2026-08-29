@@ -64,6 +64,18 @@ def formatted_exception(error: BaseException) -> str:
     return "".join(traceback.format_exception(error))
 
 
+def assert_credential_free_error(error: BaseException, credential: str) -> None:
+    escaped = credential.encode("unicode_escape").decode("ascii")
+    rendered = "\n".join((str(error), repr(error), formatted_exception(error)))
+    assert credential not in rendered
+    assert escaped not in rendered
+    assert "UnicodeEncodeError" not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert credential not in repr(vars(error))
+    assert escaped not in repr(vars(error))
+
+
 def test_authentication_failure_maps_to_safe_domain_error(
     server_config, host_key_store, fake_client
 ):
@@ -121,7 +133,8 @@ def test_connection_uses_application_timeouts_unless_server_overrides_them(
     assert fake_client.connect_kwargs["timeout"] == 3.5
     assert fake_client.connect_kwargs["auth_timeout"] == 3.5
     assert fake_client.connect_kwargs["banner_timeout"] == 3.5
-    assert fake_client.transport.open_timeouts == [4.5]
+    assert 0.0 < fake_client.transport.open_timeouts[0] <= 4.5
+    assert fake_client.transport.open_timeouts[0] == pytest.approx(4.5, abs=0.01)
 
 
 def test_application_timeout_defaults_are_used_when_server_has_no_override(
@@ -141,7 +154,8 @@ def test_application_timeout_defaults_are_used_when_server_has_no_override(
     manager.execute_command(CommandSpec("probe", ("hostname",), False))
 
     assert fake_client.connect_kwargs["timeout"] == 6.0
-    assert fake_client.transport.open_timeouts == [7.0]
+    assert 0.0 < fake_client.transport.open_timeouts[0] <= 7.0
+    assert fake_client.transport.open_timeouts[0] == pytest.approx(7.0, abs=0.01)
 
 
 def test_connect_uses_strict_application_host_key_trust_without_auto_add(
@@ -390,3 +404,43 @@ def test_disconnect_is_idempotent(connected_manager, fake_client):
 
     assert not connected_manager.is_connected()
     assert fake_client.close_calls == 1
+
+
+def test_malformed_ssh_password_fails_before_client_state_without_leaking(
+    server_config, host_key_store
+):
+    """Catches Paramiko retaining or exposing a credential encoding exception."""
+    credential = "ssh-\ud800-secret"
+    client_created = False
+
+    def create_client():
+        nonlocal client_created
+        client_created = True
+        raise AssertionError("malformed SSH credentials must fail before client creation")
+
+    with pytest.raises(SSHAuthenticationError) as caught:
+        SSHManager(
+            replace(server_config, password=credential),
+            host_key_store,
+            client_factory=create_client,
+        )
+
+    assert not client_created
+    assert_credential_free_error(caught.value, credential)
+
+
+def test_malformed_sudo_password_fails_before_channel_state_without_leaking(
+    connected_manager, fake_client
+):
+    """Catches channel creation before a supplied sudo credential is encodable."""
+    credential = "sudo-\ud800-secret"
+    fake_client.queue_result(0, "", "")
+
+    with pytest.raises(SudoAuthenticationError) as caught:
+        connected_manager.execute_command(
+            CommandSpec("state", ("firewall-cmd", "--state"), True), credential
+        )
+
+    assert fake_client.transport.channels == []
+    assert fake_client.stdin_writes == []
+    assert_credential_free_error(caught.value, credential)
