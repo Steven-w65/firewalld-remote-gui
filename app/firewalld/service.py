@@ -58,7 +58,7 @@ class ConnectionTestResult:
     hostname: str | None
     distribution: str | None
     effective_uid: int | None
-    firewalld: FirewalldInfo
+    firewalld: FirewalldInfo | None
     checks: tuple[ConnectionCheck, ...]
 
     def __post_init__(self) -> None:
@@ -163,12 +163,7 @@ class FirewalldService:
         info = self._detect_state(sudo_password)
         if not info.running:
             return info
-        try:
-            version = self._read_version(sudo_password)
-        except _TERMINAL_FIREWALL_ERRORS:
-            raise
-        except (FirewallCommandError, FirewallParseError):
-            version = None
+        version = self._read_version(sudo_password)
         return FirewalldInfo(installed=True, running=True, version=version)
 
     def _detect_state(self, sudo_password: str | None) -> FirewalldInfo:
@@ -321,7 +316,7 @@ class FirewalldService:
         try:
             firewalld = self._detect_state(sudo_password)
         except (FirewallCommandError, FirewallParseError):
-            firewalld = FirewalldInfo(installed=True, running=False, version=None)
+            firewalld = None
             checks.append(
                 ConnectionCheck(
                     "firewalld_state", False, "Unable to inspect firewalld state."
@@ -355,8 +350,30 @@ class FirewalldService:
             else:
                 try:
                     version = self._read_version(sudo_password)
-                except _TERMINAL_FIREWALL_ERRORS:
-                    raise
+                except FirewalldNotInstalledError:
+                    firewalld = FirewalldInfo(False, False, None)
+                    checks[-1] = ConnectionCheck(
+                        "firewalld_state", False, "Firewalld is not installed."
+                    )
+                    checks.append(
+                        ConnectionCheck(
+                            "firewalld_version",
+                            False,
+                            "Unable to read firewalld version.",
+                        )
+                    )
+                except FirewalldNotRunningError:
+                    firewalld = FirewalldInfo(True, False, None)
+                    checks[-1] = ConnectionCheck(
+                        "firewalld_state", False, "Firewalld is not running."
+                    )
+                    checks.append(
+                        ConnectionCheck(
+                            "firewalld_version",
+                            False,
+                            "Unable to read firewalld version.",
+                        )
+                    )
                 except (FirewallCommandError, FirewallParseError):
                     firewalld = FirewalldInfo(True, True, None)
                     checks.append(
