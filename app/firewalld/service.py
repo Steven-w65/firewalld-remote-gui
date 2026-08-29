@@ -1,8 +1,9 @@
-"""Read-only remote firewalld service assembled from approved commands."""
+"""Remote firewalld reads and verified writes assembled from approved commands."""
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -15,7 +16,13 @@ from app.firewalld.parser import (
     parse_zone_state,
 )
 from app.firewalld.system_commands import SystemCommandBuilder
-from app.models.command import CommandResult, CommandSpec
+from app.models.command import (
+    CommandResult,
+    CommandSpec,
+    CompositeOperationResult,
+    TargetResult,
+)
+from app.models.enums import ApplyTarget, TargetStatus
 from app.models.firewall import FirewallSnapshot, RichRule, ZoneState
 from app.utils.errors import (
     FirewallCommandError,
@@ -108,7 +115,7 @@ _TERMINAL_FIREWALL_ERRORS = (FirewalldNotInstalledError, FirewalldNotRunningErro
 
 
 class FirewalldService:
-    """Execute only allowlisted read commands through an injected executor."""
+    """Execute only allowlisted commands through an injected executor."""
 
     def __init__(self, executor: CommandExecutor, server_id: str) -> None:
         self._executor = executor
@@ -503,3 +510,391 @@ class FirewalldService:
             ):
                 stale = True
         return tuple(zones), stale
+
+    @staticmethod
+    def _selected_targets(target: ApplyTarget) -> tuple[ApplyTarget, ...]:
+        if target is ApplyTarget.BOTH:
+            return (ApplyTarget.PERMANENT, ApplyTarget.RUNTIME)
+        if target in (ApplyTarget.RUNTIME, ApplyTarget.PERMANENT):
+            return (target,)
+        raise InvalidFirewallArgumentError("target", "must be runtime, permanent, or both")
+
+    @staticmethod
+    def _require_global_target(target: ApplyTarget) -> None:
+        if target is not ApplyTarget.BOTH:
+            raise InvalidFirewallArgumentError(
+                "target", "global firewalld operations require both"
+            )
+
+    @staticmethod
+    def _target_failure(
+        target: ApplyTarget,
+        *,
+        result: CommandResult | None = None,
+        verification: bool = False,
+    ) -> TargetResult:
+        return TargetResult(
+            target=target,
+            execution_status=(
+                TargetStatus.SUCCEEDED if verification else TargetStatus.FAILED
+            ),
+            verification_status=(
+                TargetStatus.FAILED if verification else TargetStatus.NOT_RUN
+            ),
+            result=result,
+            message=(
+                "Firewalld state did not match the requested change."
+                if verification
+                else "The firewalld change failed."
+            ),
+        )
+
+    @staticmethod
+    def _target_success(
+        target: ApplyTarget, result: CommandResult
+    ) -> TargetResult:
+        return TargetResult(
+            target=target,
+            execution_status=TargetStatus.SUCCEEDED,
+            verification_status=TargetStatus.SUCCEEDED,
+            result=result,
+            message="",
+        )
+
+    @staticmethod
+    def _composite(
+        operation: str, results: dict[ApplyTarget, TargetResult]
+    ) -> CompositeOperationResult:
+        return CompositeOperationResult(
+            operation=operation,
+            runtime=results.get(ApplyTarget.RUNTIME),
+            permanent=results.get(ApplyTarget.PERMANENT),
+        )
+
+    def _apply_targets(
+        self,
+        operation: str,
+        target: ApplyTarget,
+        build: Callable[[bool], CommandSpec],
+        verify: Callable[[bool], bool],
+        sudo_password: str | None,
+    ) -> CompositeOperationResult:
+        results: dict[ApplyTarget, TargetResult] = {}
+        for selected in self._selected_targets(target):
+            permanent = selected is ApplyTarget.PERMANENT
+            spec = build(permanent)
+            try:
+                command_result = self._execute(spec, sudo_password)
+            except _TERMINAL_FIREWALL_ERRORS:
+                raise
+            except FirewallCommandError:
+                results[selected] = self._target_failure(selected)
+                continue
+
+            try:
+                verified = verify(permanent)
+            except _TERMINAL_FIREWALL_ERRORS:
+                raise
+            except (FirewallCommandError, FirewallParseError):
+                verified = False
+
+            results[selected] = (
+                self._target_success(selected, command_result)
+                if verified
+                else self._target_failure(
+                    selected, result=command_result, verification=True
+                )
+            )
+        return self._composite(operation, results)
+
+    def _apply_global(
+        self,
+        operation: str,
+        target: ApplyTarget,
+        spec: CommandSpec,
+        verify: Callable[[], bool],
+        sudo_password: str | None,
+    ) -> CompositeOperationResult:
+        self._require_global_target(target)
+        selected_targets = (ApplyTarget.PERMANENT, ApplyTarget.RUNTIME)
+        try:
+            command_result = self._execute(spec, sudo_password)
+        except _TERMINAL_FIREWALL_ERRORS:
+            raise
+        except FirewallCommandError:
+            return self._composite(
+                operation,
+                {
+                    selected: self._target_failure(selected)
+                    for selected in selected_targets
+                },
+            )
+
+        try:
+            verified = verify()
+        except _TERMINAL_FIREWALL_ERRORS:
+            raise
+        except (FirewallCommandError, FirewallParseError):
+            verified = False
+
+        return self._composite(
+            operation,
+            {
+                selected: (
+                    self._target_success(selected, command_result)
+                    if verified
+                    else self._target_failure(
+                        selected, result=command_result, verification=True
+                    )
+                )
+                for selected in selected_targets
+            },
+        )
+
+    def add_port(
+        self,
+        zone: str,
+        port: str,
+        protocol: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        expected = FirewalldCommandBuilder.add_port(
+            zone, port, protocol, permanent=False
+        ).argv[-1].removeprefix("--add-port=")
+        return self._apply_targets(
+            "add_port",
+            target,
+            lambda permanent: FirewalldCommandBuilder.add_port(
+                zone, port, protocol, permanent
+            ),
+            lambda permanent: expected
+            in self.list_ports(
+                zone, permanent=permanent, sudo_password=sudo_password
+            ),
+            sudo_password,
+        )
+
+    def remove_port(
+        self,
+        zone: str,
+        port: str,
+        protocol: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        expected = FirewalldCommandBuilder.remove_port(
+            zone, port, protocol, permanent=False
+        ).argv[-1].removeprefix("--remove-port=")
+        return self._apply_targets(
+            "remove_port",
+            target,
+            lambda permanent: FirewalldCommandBuilder.remove_port(
+                zone, port, protocol, permanent
+            ),
+            lambda permanent: expected
+            not in self.list_ports(
+                zone, permanent=permanent, sudo_password=sudo_password
+            ),
+            sudo_password,
+        )
+
+    def add_service(
+        self,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        return self._apply_targets(
+            "add_service",
+            target,
+            lambda permanent: FirewalldCommandBuilder.add_service(
+                zone, service, permanent
+            ),
+            lambda permanent: service
+            in self.list_services(
+                zone, permanent=permanent, sudo_password=sudo_password
+            ),
+            sudo_password,
+        )
+
+    def remove_service(
+        self,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        return self._apply_targets(
+            "remove_service",
+            target,
+            lambda permanent: FirewalldCommandBuilder.remove_service(
+                zone, service, permanent
+            ),
+            lambda permanent: service
+            not in self.list_services(
+                zone, permanent=permanent, sudo_password=sudo_password
+            ),
+            sudo_password,
+        )
+
+    def change_interface_zone(
+        self,
+        interface: str,
+        zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        return self._apply_targets(
+            "change_interface_zone",
+            target,
+            lambda permanent: FirewalldCommandBuilder.change_interface_zone(
+                interface, zone, permanent
+            ),
+            lambda permanent: interface
+            in self.get_interfaces(
+                zone, permanent=permanent, sudo_password=sudo_password
+            ),
+            sudo_password,
+        )
+
+    def add_rich_rule(
+        self,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        expected = FirewalldCommandBuilder.add_rich_rule(
+            zone,
+            source,
+            destination,
+            service,
+            port,
+            protocol,
+            action,
+            permanent=False,
+        ).argv[-1].removeprefix("--add-rich-rule=")
+        return self._apply_targets(
+            "add_rich_rule",
+            target,
+            lambda permanent: FirewalldCommandBuilder.add_rich_rule(
+                zone,
+                source,
+                destination,
+                service,
+                port,
+                protocol,
+                action,
+                permanent,
+            ),
+            lambda permanent: expected
+            in {
+                rule.rule
+                for rule in self.list_rich_rules(
+                    zone, permanent=permanent, sudo_password=sudo_password
+                )
+            },
+            sudo_password,
+        )
+
+    def remove_rich_rule(
+        self,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        expected = FirewalldCommandBuilder.remove_rich_rule(
+            zone,
+            source,
+            destination,
+            service,
+            port,
+            protocol,
+            action,
+            permanent=False,
+        ).argv[-1].removeprefix("--remove-rich-rule=")
+        return self._apply_targets(
+            "remove_rich_rule",
+            target,
+            lambda permanent: FirewalldCommandBuilder.remove_rich_rule(
+                zone,
+                source,
+                destination,
+                service,
+                port,
+                protocol,
+                action,
+                permanent,
+            ),
+            lambda permanent: expected
+            not in {
+                rule.rule
+                for rule in self.list_rich_rules(
+                    zone, permanent=permanent, sudo_password=sudo_password
+                )
+            },
+            sudo_password,
+        )
+
+    def set_default_zone(
+        self,
+        zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self._require_global_target(target)
+
+        def verify() -> bool:
+            result = self._execute(
+                FirewalldCommandBuilder.get_default_zone(), sudo_password
+            )
+            return self._single_word(result.stdout, "default zone") == zone
+
+        return self._apply_global(
+            "set_default_zone",
+            target,
+            FirewalldCommandBuilder.set_default_zone(zone),
+            verify,
+            sudo_password,
+        )
+
+    def reload_firewalld(
+        self,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self._require_global_target(target)
+
+        def verify() -> bool:
+            result = self._execute(FirewalldCommandBuilder.get_state(), sudo_password)
+            return " ".join(parse_words(result.stdout)).casefold() == "running"
+
+        return self._apply_global(
+            "reload_firewalld",
+            target,
+            FirewalldCommandBuilder.reload(),
+            verify,
+            sudo_password,
+        )
