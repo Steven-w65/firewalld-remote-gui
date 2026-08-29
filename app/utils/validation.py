@@ -2,6 +2,7 @@
 
 import ipaddress
 import re
+import unicodedata
 from collections.abc import Collection
 
 from app.utils.errors import InvalidFirewallArgumentError
@@ -62,7 +63,7 @@ def validate_inventory_token(kind: str, value: str) -> str:
         raise InvalidFirewallArgumentError(label, "must be a non-empty interface name")
     if len(value) > 16:
         raise InvalidFirewallArgumentError(label, "must be at most 16 characters")
-    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+    if any(character.isspace() or unicodedata.category(character).startswith("C") for character in value):
         raise InvalidFirewallArgumentError(label, "must not contain whitespace or control characters")
     if any(character in "/!*" for character in value):
         raise InvalidFirewallArgumentError(label, "contains unsupported characters")

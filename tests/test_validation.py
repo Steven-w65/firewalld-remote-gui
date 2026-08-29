@@ -91,6 +91,11 @@ def test_inventory_tokens_accept_their_kind_specific_valid_boundaries(kind, valu
         ("interface", "eth 0"),
         ("interface", "eth\x00"),
         ("interface", "eth\n0"),
+        ("interface", "eth\u0080"),
+        ("interface", "eth\u200e"),
+        ("interface", "eth\ud800"),
+        ("interface", "eth\ue000"),
+        ("interface", "eth\u0378"),
         ("interface", "abcdefghijklmnopq"),
     ],
 )
