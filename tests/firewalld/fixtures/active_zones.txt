@@ -1,0 +1,6 @@
+public
+  interfaces: eth0 eth1
+internal
+  sources: 10.0.0.0/8
+trusted
+  interfaces:

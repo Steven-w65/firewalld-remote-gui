@@ -68,6 +68,13 @@ def test_rich_rule_preserves_an_unstructured_remote_value():
     assert rule.action is None
 
 
+def test_rich_rule_keeps_the_existing_optional_positional_field_order():
+    rule = RichRule('rule service name="ssh" accept', "192.0.2.0/24")
+
+    assert rule.source == "192.0.2.0/24"
+    assert rule.family is None
+
+
 def test_models_are_frozen_value_objects():
     spec = CommandSpec("list_zones", ("firewall-cmd", "--get-zones"))
 

@@ -30,8 +30,11 @@ class RichRule:
     port: str | None = None
     protocol: str | None = None
     action: str | None = None
+    family: str | None = None
 
     def __post_init__(self) -> None:
+        if self.family is not None:
+            object.__setattr__(self, "family", self.family.lower())
         if self.protocol is not None:
             object.__setattr__(self, "protocol", self.protocol.lower())
 

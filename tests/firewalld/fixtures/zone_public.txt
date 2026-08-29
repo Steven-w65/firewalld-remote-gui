@@ -1,0 +1,16 @@
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: eth0 eth1
+  sources: 192.0.2.0/24 2001:db8::/64
+  services: http https ssh
+  ports: 8000-8100/tcp 53/udp
+  protocols: tcp udp
+  forward: yes
+  masquerade: no
+  forward-ports:
+  source-ports:
+  icmp-blocks:
+  rich rules:
+    rule family="ipv4" source address="192.0.2.0/24" port port="8443" protocol="tcp" accept
+    rule family="ipv6" destination address="2001:db8::/64" service name="ssh" reject

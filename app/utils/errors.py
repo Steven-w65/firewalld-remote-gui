@@ -19,6 +19,17 @@ class InvalidFirewallArgumentError(ValueError):
         super().__init__(f"Invalid {field}: {reason}")
 
 
+class FirewallParseError(ValueError):
+    """Raised when bounded, typed parsing of firewalld output cannot continue."""
+
+    _SAFE_OPERATIONS = frozenset({"active zones", "os release", "rich rules", "word list", "zone state"})
+
+    def __init__(self, operation: str, reason: str) -> None:
+        self.operation = operation if operation in self._SAFE_OPERATIONS else "firewalld output"
+        self.reason = reason[:120] if isinstance(reason, str) else "invalid output"
+        super().__init__(f"Unable to parse firewalld {self.operation} output.")
+
+
 class HostKeyStoreError(RuntimeError):
     """Raised when the application trusted-host file cannot be handled safely."""
 
