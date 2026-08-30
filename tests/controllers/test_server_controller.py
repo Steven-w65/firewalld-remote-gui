@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from threading import Event
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -105,12 +105,12 @@ def test_connect_transitions_and_publishes_only_its_snapshot(
     controller.session_changed.connect(changed.append)
 
     handle = controller.connect("web01")
-    assert handle is scheduler.pending("web01", "connect")
+    assert handle is not scheduler.pending("web01", "connect")
     assert controller.session_view("web01").status is ConnectionStatus.CONNECTING
     assert controller.session_view("web01").busy_operation == "connect"
     assert controller.session_view("db01").status is ConnectionStatus.DISCONNECTED
 
-    handle.run()
+    scheduler.pending("web01", "connect").run()
     service = service_factory_template.instances["web01"][0]
     assert service.load_calls == [None]
     assert controller.session_view("web01").snapshot == service.next_snapshot
@@ -118,12 +118,108 @@ def test_connect_transitions_and_publishes_only_its_snapshot(
     assert changed
 
 
+def test_public_handles_publish_only_safe_transformed_values(
+    controller, dependencies
+) -> None:
+    from app.controllers.server_controller import ControllerJobHandle
+
+    _, scheduler, _, _ = dependencies
+    success_values: list[object] = []
+
+    connect_handle = controller.connect("web01")
+    assert isinstance(connect_handle, ControllerJobHandle)
+    assert not hasattr(connect_handle, "work")
+    connect_handle.succeeded.connect(
+        lambda server_id, generation, operation, value: success_values.append(value)
+    )
+    scheduler.pending("web01", "connect").run()
+    connected_value = success_values[-1]
+    assert connected_value.server_id == "web01"
+    assert connected_value.status is ConnectionStatus.CONNECTED
+    assert connected_value.snapshot == controller.session_view("web01").snapshot
+    published_values = [connected_value]
+
+    for operation, request in (
+        ("refresh", lambda: controller.refresh("web01")),
+        ("test_connection", lambda: controller.test_connection("web01")),
+        ("reconnect", lambda: controller.reconnect("web01")),
+        ("disconnect", lambda: controller.disconnect("web01")),
+    ):
+        handle = request()
+        assert isinstance(handle, ControllerJobHandle)
+        assert (handle.server_id, handle.operation) == ("web01", operation)
+        assert not hasattr(handle, "work")
+        emitted: list[object] = []
+        handle.succeeded.connect(
+            lambda server_id, generation, logical_operation, value: emitted.append(value)
+        )
+        scheduler.pending("web01", operation).run()
+        assert len(emitted) == 1
+        value = emitted[0]
+        published_values.append(value)
+        assert "secret" not in repr(value)
+        assert not hasattr(value, "manager")
+        assert not hasattr(value, "service")
+        assert not hasattr(value, "config")
+        assert not callable(value)
+
+    for value in published_values:
+        assert "secret" not in repr(value)
+        assert not isinstance(value, Exception)
+        for forbidden in (
+            "manager",
+            "service",
+            "config",
+            "password",
+            "sudo_password",
+            "work",
+            "raw_error",
+        ):
+            assert not hasattr(value, forbidden)
+
+
+def test_public_failure_payload_is_fresh_fixed_and_has_no_raw_exception_state(
+    controller, dependencies
+) -> None:
+    from app.controllers.server_controller import ControllerJobHandle, ControllerOperationError
+
+    _, scheduler, manager_factory, _ = dependencies
+    raw = RuntimeError("raw ssh-web01-secret and sudo-web-secret")
+    manager_factory.next_errors["web01"] = raw
+    handle_errors: list[object] = []
+    raised_errors: list[object] = []
+    controller.error_raised.connect(
+        lambda server_id, error: raised_errors.append(error)
+    )
+
+    handle = controller.connect("web01")
+    assert isinstance(handle, ControllerJobHandle)
+    handle.failed.connect(
+        lambda server_id, generation, operation, error: handle_errors.append(error)
+    )
+    scheduler.pending("web01", "connect").run()
+
+    assert len(handle_errors) == len(raised_errors) == 1
+    for published in (*handle_errors, *raised_errors):
+        assert isinstance(published, ControllerOperationError)
+        assert published is not raw
+        assert "secret" not in repr(published)
+        assert "secret" not in published.message
+        assert not hasattr(published, "args")
+        assert not hasattr(published, "__traceback__")
+        assert not hasattr(published, "__cause__")
+        assert not hasattr(published, "__context__")
+        assert not hasattr(published, "config")
+        assert not hasattr(published, "raw_error")
+
+
 @pytest.mark.parametrize("boundary", ["started", "succeeded", "failed", "finished"])
 def test_every_old_generation_signal_boundary_is_ignored(
     controller, dependencies, boundary: str
 ) -> None:
     _, scheduler, _, _ = dependencies
-    old = controller.connect("web01")
+    controller.connect("web01")
+    old = scheduler.pending("web01", "connect")
     controller.disconnect("web01")
     before = controller.session_view("web01")
     changed: list[str] = []
@@ -154,7 +250,7 @@ def test_disconnect_increments_generation_cancels_and_clears_sudo_immediately(
     old_generation = controller.session_view("web01").generation
     assert controller.provide_sudo_password("web01", old_generation, "sudo-web-secret")
 
-    handle = controller.disconnect("web01")
+    controller.disconnect("web01")
     view = controller.session_view("web01")
     assert view.generation == old_generation + 1
     assert view.status is ConnectionStatus.DISCONNECTED
@@ -162,22 +258,20 @@ def test_disconnect_increments_generation_cancels_and_clears_sudo_immediately(
     assert not secrets_in(view)
     assert scheduler.cancelled[-1] == "web01"
 
-    handle.run()
+    scheduler.pending("web01", "disconnect").run()
     assert manager_factory.instances["web01"][0].disconnect_calls == 1
 
 
-def test_old_connect_success_is_closed_without_becoming_current(
+def test_invalidated_pending_connect_never_creates_or_adopts_manager(
     controller, dependencies
 ) -> None:
     _, scheduler, manager_factory, _ = dependencies
-    old = controller.connect("web01")
+    controller.connect("web01")
+    old = scheduler.pending("web01", "connect")
     controller.disconnect("web01")
-    resources = old.work()
-    old.emit_succeeded(resources)
+    old.run()
     assert controller.session_view("web01").snapshot is None
-    cleanup = scheduler.pending("web01", "discard_stale_connection")
-    cleanup.run()
-    assert manager_factory.instances["web01"][0].disconnect_calls == 1
+    assert manager_factory.instances == {}
 
 
 def test_reconnect_closes_old_manager_then_builds_a_new_connection(
@@ -189,10 +283,10 @@ def test_reconnect_closes_old_manager_then_builds_a_new_connection(
     old_manager = manager_factory.instances["web01"][0]
     old_generation = controller.session_view("web01").generation
 
-    handle = controller.reconnect("web01")
+    controller.reconnect("web01")
     assert controller.session_view("web01").generation == old_generation + 1
     assert controller.session_view("web01").status is ConnectionStatus.CONNECTING
-    handle.run()
+    scheduler.pending("web01", "reconnect").run()
 
     assert old_manager.disconnect_calls == 1
     assert len(manager_factory.instances["web01"]) == 2
@@ -369,7 +463,7 @@ def test_reconnect_rejects_an_active_service_operation_without_cancelling_it(
         controller.reconnect("web01")
 
     assert scheduler.cancelled == []
-    assert refresh is scheduler.pending("web01", "refresh")
+    assert refresh is not scheduler.pending("web01", "refresh")
 
 
 def test_test_connection_runs_on_live_service_without_replacing_snapshot(
@@ -382,10 +476,14 @@ def test_test_connection_runs_on_live_service_without_replacing_snapshot(
     generation = controller.session_view("web01").generation
     controller.provide_sudo_password("web01", generation, "sudo-web-secret")
 
+    results: list[object] = []
     handle = controller.test_connection("web01")
-    result = handle.run()
+    handle.succeeded.connect(
+        lambda server_id, generation, operation, value: results.append(value)
+    )
+    scheduler.pending("web01", "test_connection").run()
 
-    assert result.hostname == "web01"
+    assert results[0].hostname == "web01"
     assert service_factory.instances["web01"][0].test_calls == ["sudo-web-secret"]
     assert controller.session_view("web01").snapshot == before
 
@@ -499,8 +597,9 @@ def test_removed_then_readded_id_never_accepts_pre_removal_job_result(
     controller, dependencies
 ) -> None:
     config_manager, scheduler, manager_factory, _ = dependencies
-    old_handle = controller.connect("web01")
-    old_generation = old_handle.generation
+    public_handle = controller.connect("web01")
+    old_handle = scheduler.pending("web01", "connect")
+    old_generation = public_handle.generation
     config_manager.current = make_loaded("db01")
     controller.reload_configuration()
     config_manager.current = make_loaded("web01", "db01")
@@ -509,13 +608,11 @@ def test_removed_then_readded_id_never_accepts_pre_removal_job_result(
     assert readded.status is ConnectionStatus.DISCONNECTED
     assert readded.generation > old_generation
 
-    old_resources = old_handle.work()
-    old_handle.emit_succeeded(old_resources)
+    old_handle.run()
 
     assert controller.session_view("web01").status is ConnectionStatus.DISCONNECTED
     assert controller.session_view("web01").snapshot is None
-    scheduler.pending("web01", "discard_stale_connection").run()
-    assert manager_factory.instances["web01"][0].disconnect_calls == 1
+    assert manager_factory.instances == {}
 
 
 def test_select_is_deterministic_and_does_not_connect(controller, dependencies) -> None:
@@ -548,7 +645,27 @@ def test_real_scheduler_keeps_remote_work_off_controller_thread_and_signals_on_i
         lambda server_id: callback_threads.append(QThread.currentThread())
     )
 
-    controller.connect("web01")
+    public_events: list[tuple[object, ...]] = []
+    public_threads: list[QThread] = []
+    handle = controller.connect("web01")
+    handle.started.connect(
+        lambda *event: (
+            public_events.append(("started", *event)),
+            public_threads.append(QThread.currentThread()),
+        )
+    )
+    handle.succeeded.connect(
+        lambda *event: (
+            public_events.append(("succeeded", *event)),
+            public_threads.append(QThread.currentThread()),
+        )
+    )
+    handle.finished.connect(
+        lambda *event: (
+            public_events.append(("finished", *event)),
+            public_threads.append(QThread.currentThread()),
+        )
+    )
     assert entered.wait(1)
     qtbot.waitUntil(
         lambda: controller.session_view("web01").status
@@ -556,6 +673,7 @@ def test_real_scheduler_keeps_remote_work_off_controller_thread_and_signals_on_i
         timeout=3000,
     )
     assert scheduler.wait_for_done(3000)
+    qtbot.waitUntil(lambda: len(public_events) == 3, timeout=3000)
     manager = manager_factory.instances["web01"][0]
     service = service_factory.instances["web01"][0]
     assert manager.connect_thread is not controller.thread()
@@ -563,6 +681,13 @@ def test_real_scheduler_keeps_remote_work_off_controller_thread_and_signals_on_i
         thread is not controller.thread() for thread in service.load_threads
     )
     assert callback_threads and all(thread is controller.thread() for thread in callback_threads)
+    assert [event[:4] for event in public_events] == [
+        ("started", "web01", 0, "connect"),
+        ("succeeded", "web01", 0, "connect"),
+        ("finished", "web01", 0, "connect"),
+    ]
+    assert all(thread is controller.thread() for thread in public_threads)
+    assert "secret" not in repr(public_events[1][4])
 
     controller.refresh("web01")
     qtbot.waitUntil(lambda: not scheduler.is_busy("web01"), timeout=3000)
@@ -605,15 +730,68 @@ def test_shutdown_invalidates_all_sessions_clears_secrets_and_queues_closes(
         generation = controller.session_view(server_id).generation
         controller.provide_sudo_password(server_id, generation, f"sudo-{server_id}-secret")
 
-    handles = controller.shutdown()
+    drained = controller.shutdown(timeout_ms=123)
 
-    assert len(handles) == 2
+    assert drained
     assert all(view.status is ConnectionStatus.DISCONNECTED for view in controller.sessions())
     assert not secrets_in(controller.sessions())
-    for handle in handles:
-        handle.run()
+    assert scheduler.wait_timeouts == [123]
     assert all(
         manager.disconnect_calls == 1
         for instances in manager_factory.instances.values()
         for manager in instances
     )
+
+
+@pytest.mark.parametrize(
+    "connect_error",
+    [None, SSHConnectionError("web01", "connection failed")],
+)
+def test_shutdown_closes_inflight_connection_without_qt_callback_delivery(
+    qtbot: Any, connect_error: Exception | None
+) -> None:
+    from app.controllers.server_controller import ServerController
+
+    class ShutdownObservingScheduler(OperationScheduler):
+        def __init__(self) -> None:
+            super().__init__(max_threads=1)
+            self.cancel_seen = Event()
+
+        def cancel_pending(self, server_id: str) -> None:
+            self.cancel_seen.set()
+            super().cancel_pending(server_id)
+
+    config_manager = FakeConfigManager(make_loaded("web01"))
+    scheduler = ShutdownObservingScheduler()
+    manager_factory = ManagerFactory()
+    service_factory = ServiceFactory()
+    entered = Event()
+    release = Event()
+    manager_factory.connect_entered["web01"] = entered
+    manager_factory.connect_release["web01"] = release
+    if connect_error is not None:
+        manager_factory.next_errors["web01"] = connect_error
+    controller = ServerController(
+        config_manager, scheduler, manager_factory, service_factory
+    )
+    controller.connect("web01")
+    assert entered.wait(1)
+
+    def release_after_invalidation() -> None:
+        assert scheduler.cancel_seen.wait(2)
+        release.set()
+
+    releaser = Thread(target=release_after_invalidation)
+    releaser.start()
+    assert controller.shutdown(timeout_ms=3000)
+    releaser.join(2)
+    assert not releaser.is_alive()
+
+    manager = manager_factory.instances["web01"][0]
+    assert manager.disconnect_calls == 1
+    assert manager.disconnect_thread is not controller.thread()
+    view = controller.session_view("web01")
+    assert view.status is ConnectionStatus.DISCONNECTED
+    assert view.snapshot is None
+    assert not secrets_in(view)
+    assert scheduler.wait_for_done(100)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from threading import Event, Lock
 from typing import Any, Protocol, cast
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -16,14 +17,11 @@ from app.models.enums import ConnectionStatus
 from app.models.firewall import FirewallSnapshot
 from app.utils.errors import (
     ChangedHostKeyError,
-    CommandTimeoutError,
     ConfigurationError,
     FirewallCommandError,
     FirewallParseError,
     FirewalldNotInstalledError,
     FirewalldNotRunningError,
-    HostKeyStoreError,
-    InvalidHostTokenError,
     PermissionDeniedError,
     SSHAuthenticationError,
     SSHConnectionError,
@@ -67,6 +65,8 @@ class _Scheduler(Protocol):
 
     def cancel_pending(self, server_id: str) -> None: ...
 
+    def wait_for_done(self, timeout_ms: int = -1) -> bool: ...
+
 
 ManagerFactory = Callable[[ServerConfig, ApplicationConfig], _Manager]
 ServiceFactory = Callable[[_Manager, str], _Service]
@@ -82,24 +82,94 @@ class SudoPasswordRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ControllerOperationError:
+    """A fixed, credential-free controller failure payload."""
+
+    server_id: str
+    operation: str
+    category: str
+    message: str
+
+
+class ControllerJobHandle(QObject):
+    """Public lifecycle facade that never owns scheduler work or resources."""
+
+    started = Signal(str, int, str)
+    succeeded = Signal(str, int, str, object)
+    failed = Signal(str, int, str, object)
+    finished = Signal(str, int, str)
+
+    def __init__(self, server_id: str, generation: int, operation: str) -> None:
+        super().__init__()
+        self.server_id = server_id
+        self.generation = generation
+        self.operation = operation
+
+
+class _ConnectionInvalidated(RuntimeError):
+    """Private worker control flow; never published through the facade."""
+
+
+class _ConnectionAttempt:
+    """Synchronize invalidation with worker resource ownership."""
+
+    def __init__(self) -> None:
+        self._invalidated = Event()
+        self._lock = Lock()
+        self._manager: _Manager | None = None
+        self._worker_finished = False
+        self._close_claimed = False
+
+    def register_manager(self, manager: _Manager) -> None:
+        with self._lock:
+            self._manager = manager
+
+    def is_invalidated(self) -> bool:
+        return self._invalidated.is_set()
+
+    def commit_success(self) -> bool:
+        """Return false when this worker must close instead of returning."""
+        with self._lock:
+            self._worker_finished = True
+            if not self._invalidated.is_set():
+                return True
+            self._close_claimed = True
+            return False
+
+    def claim_failure_close(self) -> _Manager | None:
+        with self._lock:
+            self._worker_finished = True
+            if self._manager is None or self._close_claimed:
+                return None
+            self._close_claimed = True
+            return self._manager
+
+    def invalidate(self) -> _Manager | None:
+        """Invalidate first; claim a manager only after its worker returned."""
+        self._invalidated.set()
+        with self._lock:
+            if (
+                not self._worker_finished
+                or self._manager is None
+                or self._close_claimed
+            ):
+                return None
+            self._close_claimed = True
+            return self._manager
+
+
+@dataclass(frozen=True, slots=True)
 class _ConnectedResources:
     manager: _Manager
     service: _Service
     snapshot: FirewallSnapshot
+    attempt: _ConnectionAttempt
 
 
-_KNOWN_SAFE_ERRORS = (
-    ChangedHostKeyError,
-    CommandTimeoutError,
-    ConfigurationError,
-    FirewallCommandError,
-    FirewallParseError,
-    HostKeyStoreError,
-    InvalidHostTokenError,
-    SSHError,
-    SystemProbeError,
-    UnknownHostKeyError,
-)
+@dataclass(slots=True)
+class _PublicJobRecord:
+    internal: JobHandle[Any]
+    public: ControllerJobHandle
 
 
 class ServerController(QObject):
@@ -132,6 +202,8 @@ class ServerController(QObject):
         self._generations = {config.id: 0 for config in self._loaded.servers}
         self._order = tuple(config.id for config in self._loaded.servers)
         self._selected_server_id = self._order[0] if self._order else None
+        self._jobs: dict[tuple[str, int, str], _PublicJobRecord] = {}
+        self._private_close_handles: set[JobHandle[Any]] = set()
 
     @property
     def selected_server_id(self) -> str | None:
@@ -172,7 +244,7 @@ class ServerController(QObject):
         session.sudo_password = password
         return True
 
-    def connect(self, server_id: str) -> JobHandle[_ConnectedResources]:
+    def connect(self, server_id: str) -> ControllerJobHandle:
         session = self._session(server_id)
         allowed = {
             ConnectionStatus.DISCONNECTED,
@@ -193,34 +265,37 @@ class ServerController(QObject):
         session.latest_error = None
         session.snapshot = None
         session.busy_operation = "connect"
+        attempt = _ConnectionAttempt()
+        session._connection_attempt = attempt
         self.session_changed.emit(server_id)
-        return cast(
-            JobHandle[_ConnectedResources],
-            self._submit_connection(session, "connect", manager_to_close=None),
+        return self._submit_connection(
+            session,
+            "connect",
+            managers_to_close=(),
+            attempt=attempt,
         )
 
-    def disconnect(self, server_id: str) -> JobHandle[None]:
+    def disconnect(self, server_id: str) -> ControllerJobHandle:
         session = self._session(server_id)
         if session.status is ConnectionStatus.DISCONNECTED:
             raise RuntimeError(f"Cannot disconnect server '{server_id}' while disconnected.")
-        manager = session._ssh_manager
+        attempt_manager = self._invalidate_attempt(session)
+        manager = cast(_Manager | None, session._ssh_manager)
         generation = self._advance_generation(session)
         self._scheduler.cancel_pending(server_id)
         self._detach(session, clear_snapshot=True)
         session.status = ConnectionStatus.DISCONNECTED
         session.busy_operation = "disconnect"
         self.session_changed.emit(server_id)
-        return cast(
-            JobHandle[None],
-            self._submit(
-                server_id,
-                generation,
-                "disconnect",
-                (lambda: manager.disconnect()) if manager is not None else (lambda: None),
-            ),
+        managers = self._unique_managers(manager, attempt_manager)
+        return self._submit(
+            server_id,
+            generation,
+            "disconnect",
+            lambda: self._disconnect_managers(managers),
         )
 
-    def reconnect(self, server_id: str) -> JobHandle[_ConnectedResources]:
+    def reconnect(self, server_id: str) -> ControllerJobHandle:
         session = self._session(server_id)
         self._require_state(
             session,
@@ -228,42 +303,41 @@ class ServerController(QObject):
             set(ConnectionStatus) - {ConnectionStatus.DISCONNECTED},
             require_idle=True,
         )
-        old_manager = session._ssh_manager
+        attempt_manager = self._invalidate_attempt(session)
+        old_manager = cast(_Manager | None, session._ssh_manager)
         self._advance_generation(session)
         self._scheduler.cancel_pending(server_id)
         self._detach(session, clear_snapshot=True)
         session.status = ConnectionStatus.CONNECTING
         session.busy_operation = "reconnect"
+        attempt = _ConnectionAttempt()
+        session._connection_attempt = attempt
         self.session_changed.emit(server_id)
-        return cast(
-            JobHandle[_ConnectedResources],
-            self._submit_connection(session, "reconnect", old_manager),
+        return self._submit_connection(
+            session,
+            "reconnect",
+            managers_to_close=self._unique_managers(old_manager, attempt_manager),
+            attempt=attempt,
         )
 
-    def refresh(self, server_id: str) -> JobHandle[FirewallSnapshot]:
+    def refresh(self, server_id: str) -> ControllerJobHandle:
         session = self._live_idle_session(server_id, "refresh")
         service = cast(_Service, session._service)
         sudo_password = session.sudo_password
-        return cast(
-            JobHandle[FirewallSnapshot],
-            self._start_service_job(
-                session,
-                "refresh",
-                lambda: service.load_snapshot(sudo_password=sudo_password),
-            ),
+        return self._start_service_job(
+            session,
+            "refresh",
+            lambda: service.load_snapshot(sudo_password=sudo_password),
         )
 
-    def test_connection(self, server_id: str) -> JobHandle[ConnectionTestResult]:
+    def test_connection(self, server_id: str) -> ControllerJobHandle:
         session = self._live_idle_session(server_id, "test_connection")
         service = cast(_Service, session._service)
         sudo_password = session.sudo_password
-        return cast(
-            JobHandle[ConnectionTestResult],
-            self._start_service_job(
-                session,
-                "test_connection",
-                lambda: service.connection_test(sudo_password=sudo_password),
-            ),
+        return self._start_service_job(
+            session,
+            "test_connection",
+            lambda: service.connection_test(sudo_password=sudo_password),
         )
 
     def reload_configuration(self) -> ConfigDiff | None:
@@ -278,17 +352,19 @@ class ServerController(QObject):
         old_sessions = self._sessions
         for server_id in (*diff.changed, *diff.removed):
             old = old_sessions[server_id]
-            manager = old._ssh_manager
+            attempt_manager = self._invalidate_attempt(old)
+            manager = cast(_Manager | None, old._ssh_manager)
             generation = self._advance_generation(old)
             self._scheduler.cancel_pending(server_id)
             self._detach(old, clear_snapshot=True)
-            if manager is not None:
+            managers = self._unique_managers(manager, attempt_manager)
+            if managers:
                 operation = (
                     "close_replaced_session"
                     if server_id in diff.changed
                     else "close_removed_session"
                 )
-                self._submit_close(server_id, generation, operation, manager)
+                self._submit_close(server_id, generation, operation, managers)
 
         reconciled: dict[str, ServerSession] = {}
         for config in loaded.servers:
@@ -319,58 +395,78 @@ class ServerController(QObject):
             self.selection_changed.emit(selected or "")
         return diff
 
-    def shutdown(self) -> tuple[JobHandle[None], ...]:
-        """Invalidate every session and queue resource closure off the GUI thread."""
-        handles: list[JobHandle[None]] = []
+    def shutdown(self, timeout_ms: int = 5000) -> bool:
+        """Invalidate, queue closure, and boundedly drain remote work."""
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
+            raise TypeError("timeout_ms must be an integer")
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be non-negative")
         for server_id in self._order:
             session = self._sessions[server_id]
-            manager = session._ssh_manager
+            attempt_manager = self._invalidate_attempt(session)
+            manager = cast(_Manager | None, session._ssh_manager)
             generation = self._advance_generation(session)
             self._scheduler.cancel_pending(server_id)
             self._detach(session, clear_snapshot=True)
             session.status = ConnectionStatus.DISCONNECTED
-            if manager is not None:
-                handles.append(
-                    cast(
-                        JobHandle[None],
-                        self._submit_close(
-                            server_id, generation, "shutdown_disconnect", manager
-                        ),
-                    )
+            managers = self._unique_managers(manager, attempt_manager)
+            if managers:
+                self._submit_close(
+                    server_id,
+                    generation,
+                    "shutdown_disconnect",
+                    managers,
                 )
         self.sessions_changed.emit()
-        return tuple(handles)
+        drained = self._scheduler.wait_for_done(timeout_ms)
+        self._jobs.clear()
+        self._private_close_handles.clear()
+        return drained
 
     def _submit_connection(
         self,
         session: ServerSession,
         operation: str,
-        manager_to_close: _Manager | None,
-    ) -> JobHandle[Any]:
+        managers_to_close: tuple[_Manager, ...],
+        attempt: _ConnectionAttempt,
+    ) -> ControllerJobHandle:
         server = session.config
         application = self._loaded.application
         sudo_password = session.sudo_password
 
         def work() -> _ConnectedResources:
-            if manager_to_close is not None:
-                manager_to_close.disconnect()
-            manager = self._manager_factory(server, application)
+            self._disconnect_managers(managers_to_close)
             try:
+                if attempt.is_invalidated():
+                    raise _ConnectionInvalidated()
+                manager = self._manager_factory(server, application)
+                attempt.register_manager(manager)
+                if attempt.is_invalidated():
+                    raise _ConnectionInvalidated()
                 manager.connect()
+                if attempt.is_invalidated():
+                    raise _ConnectionInvalidated()
                 service = self._service_factory(manager, server.id)
+                if attempt.is_invalidated():
+                    raise _ConnectionInvalidated()
                 snapshot = service.load_snapshot(sudo_password=sudo_password)
                 if not isinstance(snapshot, FirewallSnapshot):
                     raise TypeError("service must return FirewallSnapshot")
-                return _ConnectedResources(manager, service, snapshot)
+                if not attempt.commit_success():
+                    manager.disconnect()
+                    raise _ConnectionInvalidated()
+                return _ConnectedResources(manager, service, snapshot, attempt)
             except Exception:
-                manager.disconnect()
+                manager_to_close = attempt.claim_failure_close()
+                if manager_to_close is not None:
+                    manager_to_close.disconnect()
                 raise
 
         return self._submit(server.id, session.generation, operation, work)
 
     def _start_service_job(
         self, session: ServerSession, operation: str, work: Callable[[], Any]
-    ) -> JobHandle[Any]:
+    ) -> ControllerJobHandle:
         session.busy_operation = operation
         session.latest_error = None
         self.session_changed.emit(session.config.id)
@@ -382,35 +478,55 @@ class ServerController(QObject):
         generation: int,
         operation: str,
         work: Callable[[], Any],
-    ) -> JobHandle[Any]:
-        handle = self._scheduler.submit(server_id, generation, operation, work)
+    ) -> ControllerJobHandle:
+        key = (server_id, generation, operation)
+        if key in self._jobs:
+            raise RuntimeError("A controller operation with this identity already exists.")
+        internal = self._scheduler.submit(server_id, generation, operation, work)
+        public = ControllerJobHandle(server_id, generation, operation)
+        self._jobs[key] = _PublicJobRecord(internal=internal, public=public)
         queued = Qt.ConnectionType.QueuedConnection
-        handle.started.connect(self._on_started, queued)
-        handle.succeeded.connect(self._on_succeeded, queued)
-        handle.failed.connect(self._on_failed, queued)
-        handle.finished.connect(self._on_finished, queued)
-        return handle
+        internal.started.connect(self._on_started, queued)
+        internal.succeeded.connect(self._on_succeeded, queued)
+        internal.failed.connect(self._on_failed, queued)
+        internal.finished.connect(self._on_finished, queued)
+        return public
 
     def _submit_close(
         self,
         server_id: str,
         generation: int,
         operation: str,
-        manager: _Manager,
+        managers: tuple[_Manager, ...],
     ) -> JobHandle[Any]:
-        return self._scheduler.submit(
-            server_id, generation, operation, manager.disconnect
+        handle = self._scheduler.submit(
+            server_id,
+            generation,
+            operation,
+            lambda: self._disconnect_managers(managers),
         )
+        self._private_close_handles.add(handle)
+        handle.finished.connect(
+            lambda completed_server_id, completed_generation, completed_operation: (
+                self._private_close_handles.discard(handle)
+            ),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        return handle
 
     @Slot(str, int, str)
     def _on_started(
         self, server_id: str, generation: int, operation: str
     ) -> None:
+        record = self._jobs.get((server_id, generation, operation))
+        if record is None:
+            return
         if not self._is_current(server_id, generation):
             return
         session = self._sessions[server_id]
         if session.busy_operation != operation:
             return
+        record.public.started.emit(server_id, generation, operation)
 
     @Slot(str, int, str, object)
     def _on_succeeded(
@@ -420,46 +536,75 @@ class ServerController(QObject):
         operation: str,
         value: object,
     ) -> None:
+        record = self._jobs.get((server_id, generation, operation))
+        if record is None:
+            return
         if not self._is_current(server_id, generation):
             if isinstance(value, _ConnectedResources):
+                manager = value.attempt.invalidate()
                 current_generation = (
                     self._sessions[server_id].generation
                     if server_id in self._sessions
                     else generation + 1
                 )
-                self._submit_close(
-                    server_id,
-                    current_generation,
-                    "discard_stale_connection",
-                    value.manager,
-                )
+                if manager is not None:
+                    self._submit_close(
+                        server_id,
+                        current_generation,
+                        "discard_stale_connection",
+                        (manager,),
+                    )
             return
         session = self._sessions[server_id]
         if session.busy_operation != operation:
             return
+        public_value: object = None
         if operation in {"connect", "reconnect"}:
             if not isinstance(value, _ConnectedResources):
-                self._apply_failure(
+                public_error = self._apply_failure(
                     session, operation, TypeError("connection returned invalid state")
+                )
+                record.public.failed.emit(
+                    server_id, generation, operation, public_error
                 )
                 return
             session._ssh_manager = value.manager
             session._service = value.service
+            session._connection_attempt = None
             session.snapshot = value.snapshot
             session.status = ConnectionStatus.CONNECTED
             session.latest_error = None
             self.session_changed.emit(server_id)
+            public_value = session.view()
         elif operation == "refresh":
             if not isinstance(value, FirewallSnapshot):
-                self._apply_failure(
+                public_error = self._apply_failure(
                     session, operation, TypeError("refresh returned invalid state")
+                )
+                record.public.failed.emit(
+                    server_id, generation, operation, public_error
                 )
                 return
             session.snapshot = value
             session.latest_error = None
             self.session_changed.emit(server_id)
+            public_value = value
         elif operation == "test_connection":
+            if not isinstance(value, ConnectionTestResult):
+                public_error = self._apply_failure(
+                    session,
+                    operation,
+                    TypeError("connection test returned invalid state"),
+                )
+                record.public.failed.emit(
+                    server_id, generation, operation, public_error
+                )
+                return
             session.latest_error = None
+            public_value = value
+        record.public.succeeded.emit(
+            server_id, generation, operation, public_value
+        )
 
     @Slot(str, int, str, object)
     def _on_failed(
@@ -469,30 +614,34 @@ class ServerController(QObject):
         operation: str,
         error: object,
     ) -> None:
+        record = self._jobs.get((server_id, generation, operation))
+        if record is None:
+            return
         if not self._is_current(server_id, generation):
             return
         session = self._sessions[server_id]
         if session.busy_operation != operation:
             return
-        actual = error if isinstance(error, Exception) else RuntimeError("Operation failed.")
-        self._apply_failure(session, operation, actual)
+        public_error = self._apply_failure(session, operation, error)
+        record.public.failed.emit(server_id, generation, operation, public_error)
 
     @Slot(str, int, str)
     def _on_finished(
         self, server_id: str, generation: int, operation: str
     ) -> None:
-        if not self._is_current(server_id, generation):
-            return
-        session = self._sessions[server_id]
-        if session.busy_operation != operation:
-            return
-        session.busy_operation = None
-        self.session_changed.emit(server_id)
+        record = self._jobs.pop((server_id, generation, operation), None)
+        if self._is_current(server_id, generation):
+            session = self._sessions[server_id]
+            if session.busy_operation == operation:
+                session.busy_operation = None
+                self.session_changed.emit(server_id)
+        if record is not None:
+            record.public.finished.emit(server_id, generation, operation)
 
     def _apply_failure(
-        self, session: ServerSession, operation: str, error: Exception
-    ) -> None:
-        public_error = self._public_error(session, error)
+        self, session: ServerSession, operation: str, error: object
+    ) -> ControllerOperationError:
+        public_error = self._public_error(session.config.id, operation, error)
         if isinstance(error, (SSHAuthenticationError, SudoAuthenticationError)):
             session.sudo_password = None
         if isinstance(error, UnknownHostKeyError):
@@ -519,6 +668,9 @@ class ServerController(QObject):
         elif operation in {"connect", "reconnect"}:
             session.status = ConnectionStatus.CONNECTION_ERROR
 
+        if operation in {"connect", "reconnect"}:
+            session._connection_attempt = None
+
         if operation == "refresh" and session.snapshot is not None:
             session.snapshot = replace(session.snapshot, stale=True)
         if isinstance(error, SSHConnectionError) and session._ssh_manager is not None:
@@ -530,20 +682,44 @@ class ServerController(QObject):
                 session.config.id,
                 session.generation,
                 "close_failed_connection",
-                manager,
+                (manager,),
             )
-        session.latest_error = public_error
+        session.latest_error = public_error.message
         self.error_raised.emit(session.config.id, public_error)
         self.session_changed.emit(session.config.id)
+        return public_error
 
-    def _public_error(self, session: ServerSession, error: Exception) -> Exception:
-        if isinstance(error, _KNOWN_SAFE_ERRORS):
-            return error
-        message = str(error)
-        for secret in (session.config.password, session.sudo_password):
-            if secret:
-                message = message.replace(secret, "[REDACTED]")
-        return RuntimeError(message or "Operation failed.")
+    @staticmethod
+    def _public_error(
+        server_id: str, operation: str, error: object
+    ) -> ControllerOperationError:
+        if isinstance(error, UnknownHostKeyError):
+            category, message = "host_key_required", "SSH host key confirmation is required."
+        elif isinstance(error, ChangedHostKeyError):
+            category, message = "host_key_changed", "The SSH host key has changed."
+        elif isinstance(error, SSHAuthenticationError):
+            category, message = "ssh_authentication", "SSH authentication failed."
+        elif isinstance(error, SudoAuthenticationError):
+            category, message = "sudo_authentication", "Sudo authentication failed."
+        elif isinstance(error, SudoAuthenticationRequiredError):
+            category, message = "sudo_required", "Sudo authentication is required."
+        elif isinstance(error, PermissionDeniedError):
+            category, message = "permission", "The remote operation was not authorized."
+        elif isinstance(error, FirewalldNotInstalledError):
+            category, message = "firewalld_missing", "Firewalld is not installed."
+        elif isinstance(error, FirewalldNotRunningError):
+            category, message = "firewalld_stopped", "Firewalld is not running."
+        elif isinstance(error, SSHError):
+            category, message = "ssh", "The SSH operation failed."
+        elif isinstance(error, FirewallParseError):
+            category, message = "firewalld_output", "Firewalld returned invalid output."
+        elif isinstance(error, FirewallCommandError):
+            category, message = "firewalld", "The firewalld operation failed."
+        elif isinstance(error, SystemProbeError):
+            category, message = "system_probe", "The remote system probe failed."
+        else:
+            category, message = "operation", "The remote operation failed."
+        return ControllerOperationError(server_id, operation, category, message)
 
     def _live_idle_session(self, server_id: str, operation: str) -> ServerSession:
         session = self._session(server_id)
@@ -598,6 +774,29 @@ class ServerController(QObject):
         self._generations[server_id] = generation
         return generation
 
+    @staticmethod
+    def _invalidate_attempt(session: ServerSession) -> _Manager | None:
+        attempt = cast(_ConnectionAttempt | None, session._connection_attempt)
+        session._connection_attempt = None
+        return None if attempt is None else attempt.invalidate()
+
+    @staticmethod
+    def _unique_managers(
+        *managers: _Manager | None,
+    ) -> tuple[_Manager, ...]:
+        unique: list[_Manager] = []
+        identities: set[int] = set()
+        for manager in managers:
+            if manager is not None and id(manager) not in identities:
+                identities.add(id(manager))
+                unique.append(manager)
+        return tuple(unique)
+
+    @staticmethod
+    def _disconnect_managers(managers: tuple[_Manager, ...]) -> None:
+        for manager in managers:
+            manager.disconnect()
+
     def _is_current(self, server_id: str, generation: int) -> bool:
         session = self._sessions.get(server_id)
         return session is not None and session.generation == generation
@@ -606,6 +805,7 @@ class ServerController(QObject):
     def _detach(session: ServerSession, *, clear_snapshot: bool) -> None:
         session._ssh_manager = None
         session._service = None
+        session._connection_attempt = None
         session.sudo_password = None
         session.latest_error = None
         session.busy_operation = None

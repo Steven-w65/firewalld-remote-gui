@@ -35,11 +35,12 @@ class ServerSession:
     generation: int = 0
     status: ConnectionStatus = ConnectionStatus.DISCONNECTED
     snapshot: FirewallSnapshot | None = None
-    latest_error: Exception | None = field(default=None, repr=False)
+    latest_error: str | None = field(default=None, repr=False)
     sudo_password: str | None = field(default=None, repr=False)
     busy_operation: str | None = None
     _ssh_manager: Any | None = field(default=None, repr=False)
     _service: Any | None = field(default=None, repr=False)
+    _connection_attempt: Any | None = field(default=None, repr=False)
 
     def view(self) -> ServerSessionView:
         """Copy only immutable, credential-free values for presentation."""
@@ -53,8 +54,6 @@ class ServerSession:
             generation=self.generation,
             status=self.status,
             snapshot=self.snapshot,
-            latest_error=(
-                None if self.latest_error is None else str(self.latest_error)
-            ),
+            latest_error=self.latest_error,
             busy_operation=self.busy_operation,
         )

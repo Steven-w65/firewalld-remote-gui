@@ -84,6 +84,7 @@ class ManualJobHandle(QObject):
         self.generation = generation
         self.operation = operation
         self.work = work
+        self.has_run = False
 
     def emit_started(self) -> None:
         self.started.emit(self.server_id, self.generation, self.operation)
@@ -114,6 +115,7 @@ class ManualJobHandle(QObject):
             loop.exec()
 
     def run(self) -> object:
+        self.has_run = True
         self.emit_started()
         try:
             value = self.work()
@@ -130,6 +132,7 @@ class ManualScheduler:
     def __init__(self) -> None:
         self.handles: list[ManualJobHandle] = []
         self.cancelled: list[str] = []
+        self.wait_timeouts: list[int] = []
 
     def submit(
         self,
@@ -144,6 +147,14 @@ class ManualScheduler:
 
     def cancel_pending(self, server_id: str) -> None:
         self.cancelled.append(server_id)
+
+    def wait_for_done(self, timeout_ms: int = -1) -> bool:
+        self.wait_timeouts.append(timeout_ms)
+        while True:
+            pending = [handle for handle in self.handles if not handle.has_run]
+            if not pending:
+                return True
+            pending[0].run()
 
     def pending(
         self, server_id: str, operation: str | None = None
@@ -168,6 +179,7 @@ class FakeSSHManager:
     connect_thread: object | None = None
     disconnect_thread: object | None = None
     connect_entered: Event | None = None
+    connect_release: Event | None = None
 
     def connect(self) -> None:
         from PySide6.QtCore import QThread
@@ -176,6 +188,8 @@ class FakeSSHManager:
         self.connect_thread = QThread.currentThread()
         if self.connect_entered is not None:
             self.connect_entered.set()
+        if self.connect_release is not None:
+            assert self.connect_release.wait(3)
         if self.connect_error is not None:
             raise self.connect_error
 
@@ -191,6 +205,7 @@ class ManagerFactory:
         self.instances: dict[str, list[FakeSSHManager]] = defaultdict(list)
         self.next_errors: dict[str, Exception] = {}
         self.connect_entered: dict[str, Event] = {}
+        self.connect_release: dict[str, Event] = {}
 
     def __call__(
         self, server: ServerConfig, application: ApplicationConfig
@@ -200,6 +215,7 @@ class ManagerFactory:
             server_id=server.id,
             connect_error=self.next_errors.pop(server.id, None),
             connect_entered=self.connect_entered.get(server.id),
+            connect_release=self.connect_release.get(server.id),
         )
         self.instances[server.id].append(manager)
         return manager
