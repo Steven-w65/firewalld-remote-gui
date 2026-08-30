@@ -233,8 +233,8 @@ class MainWindow(QMainWindow):
             risk=LockoutRisk(
                 RiskLevel.NONE,
                 (
-                    "Reloading firewalld applies the global runtime and permanent "
-                    "configuration.",
+                    "Reloading firewalld loads the permanent configuration into "
+                    "runtime and may discard runtime-only changes.",
                 ),
             ),
         )

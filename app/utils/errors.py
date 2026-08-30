@@ -217,3 +217,30 @@ class SudoAuthenticationError(SudoAuthenticationRequiredError):
             f"Sudo authentication failed for server '{server_id}' "
             f"during operation '{operation}'.",
         )
+
+
+class PostMutationError(RuntimeError):
+    """Credential-free failure raised only after a remote mutation succeeded."""
+
+    def __init__(self, server_id: str, operation: str, phase: str) -> None:
+        self.server_id = server_id
+        self.operation = operation
+        self.phase = phase
+        super().__init__(
+            f"Post-mutation {phase} failed for firewalld operation "
+            f"'{operation}' on server '{server_id}'."
+        )
+
+
+class PostMutationVerificationError(PostMutationError):
+    """A completed mutation could not be verified without re-executing it."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        super().__init__(server_id, operation, "verification")
+
+
+class PostMutationRefreshError(PostMutationError):
+    """A verified mutation completed but its fresh snapshot could not be read."""
+
+    def __init__(self, server_id: str, operation: str) -> None:
+        super().__init__(server_id, operation, "refresh")

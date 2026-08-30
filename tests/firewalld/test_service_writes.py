@@ -9,6 +9,8 @@ from app.models.enums import ApplyTarget, TargetStatus
 from app.utils.errors import (
     FirewalldNotRunningError,
     InvalidFirewallArgumentError,
+    PostMutationVerificationError,
+    SudoAuthenticationError,
     SudoAuthenticationRequiredError,
 )
 from tests.firewalld.fakes import ScriptedExecutor
@@ -400,6 +402,32 @@ def test_reload_requires_both_and_executes_and_verifies_global_effect_once(
     assert result.runtime is not None and result.permanent is not None
     assert result.runtime.result is result.permanent.result
     assert result.operation == "reload_firewalld"
+    scripted_executor.assert_exhausted()
+
+
+@pytest.mark.parametrize(
+    "verification_error",
+    (
+        SudoAuthenticationRequiredError("web01", "get_state"),
+        SudoAuthenticationError("web01", "get_state"),
+    ),
+)
+def test_reload_post_mutation_auth_verification_raises_safe_phase_error_without_rewrite(
+    service: FirewalldService,
+    scripted_executor: ScriptedExecutor,
+    verification_error: Exception,
+) -> None:
+    scripted_executor.respond("reload")
+    scripted_executor.raise_error("get_state", verification_error)
+
+    with pytest.raises(RuntimeError) as raised:
+        service.reload_firewalld(ApplyTarget.BOTH, sudo_password="one-use")
+
+    assert isinstance(raised.value, PostMutationVerificationError)
+    assert not isinstance(raised.value, SudoAuthenticationRequiredError)
+    assert raised.value.__context__ is None
+    assert "one-use" not in repr(raised.value)
+    assert _operations(scripted_executor) == ["reload", "get_state"]
     scripted_executor.assert_exhausted()
 
 

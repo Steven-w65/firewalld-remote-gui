@@ -99,6 +99,18 @@ _CATEGORY_PRESENTATIONS = {
         "The approved firewalld operation failed.",
         "error",
     ),
+    "post_mutation_verification": _ErrorPresentation(
+        "Reload Verification Incomplete",
+        "Firewalld reloaded, but its running state could not be verified. "
+        "Refresh or reconnect before making more changes.",
+        "warning",
+    ),
+    "post_mutation_refresh": _ErrorPresentation(
+        "Reload Completed; Refresh Failed",
+        "Firewalld reloaded, but fresh firewall data could not be loaded. "
+        "Existing firewall data is stale.",
+        "warning",
+    ),
     "system_probe": _ErrorPresentation(
         "System Probe Failed",
         "The remote system identity check failed.",

@@ -31,6 +31,9 @@ from app.utils.errors import (
     FirewalldNotRunningError,
     InvalidFirewallArgumentError,
     PermissionDeniedError,
+    PostMutationVerificationError,
+    SudoAuthenticationError,
+    SudoAuthenticationRequiredError,
     SystemProbeError,
     UnsupportedFirewalldFeatureError,
 )
@@ -630,12 +633,20 @@ class FirewalldService:
                 },
             )
 
+        post_mutation_error: PostMutationVerificationError | None = None
         try:
             verified = verify()
+        except (SudoAuthenticationError, SudoAuthenticationRequiredError):
+            post_mutation_error = PostMutationVerificationError(
+                self._server_id, operation
+            )
         except _TERMINAL_FIREWALL_ERRORS:
             raise
         except (FirewallCommandError, FirewallParseError):
             verified = False
+
+        if post_mutation_error is not None:
+            raise post_mutation_error
 
         return self._composite(
             operation,

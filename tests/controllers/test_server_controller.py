@@ -15,6 +15,7 @@ from app.utils.errors import (
     ChangedHostKeyError,
     ConfigurationError,
     HostKeyStoreError,
+    PostMutationVerificationError,
     SSHAuthenticationError,
     SSHConnectionError,
     SudoAuthenticationError,
@@ -1631,3 +1632,107 @@ def test_reload_transport_failure_uses_existing_terminal_detach_and_close_path(
     assert view.snapshot is not None and view.snapshot.stale
     scheduler.pending("web01", "close_failed_connection").run()
     assert manager.disconnect_calls == 1
+
+
+@pytest.mark.parametrize(
+    "refresh_error",
+    (
+        SudoAuthenticationRequiredError("web01", "load_snapshot"),
+        SudoAuthenticationError("web01", "load_snapshot"),
+    ),
+)
+def test_reload_post_mutation_refresh_auth_failure_never_prompts_or_reloads(
+    controller, dependencies, refresh_error: Exception
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    before = controller.session_view("web01").snapshot
+    generation = controller.session_view("web01").generation
+    assert controller.provide_sudo_password(
+        "web01", generation, "sudo-cached-secret"
+    )
+    service.operation_trace.clear()
+    service.next_load_error = refresh_error
+    requests: list[object] = []
+    failures: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+
+    handle = controller.reload_firewalld("web01")
+    handle.failed.connect(
+        lambda _server_id, _generation, _operation, error: failures.append(error)
+    )
+    scheduler.pending("web01", "reload_firewalld").run()
+
+    assert service.reload_calls == [
+        (ApplyTarget.BOTH, "sudo-cached-secret"),
+    ]
+    assert service.operation_trace == ["reload_firewalld", "load_snapshot"]
+    assert requests == []
+    assert len(failures) == 1
+    assert failures[0].category == "post_mutation_refresh"
+    assert "secret" not in repr(failures[0])
+    view = controller.session_view("web01")
+    assert view.status is ConnectionStatus.CONNECTED
+    assert view.snapshot is not None and view.snapshot.stale
+    assert view.snapshot == make_snapshot(server_id="web01", stale=True)
+    assert before is not None
+
+    service.next_snapshot = make_snapshot(server_id="web01", default_zone="internal")
+    controller.refresh("web01")
+    scheduler.pending("web01", "refresh").run()
+    assert service.load_calls[-1] is None
+    assert len(service.reload_calls) == 1
+
+
+def test_reload_post_mutation_verification_error_never_prompts_or_reloads(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    generation = controller.session_view("web01").generation
+    assert controller.provide_sudo_password(
+        "web01", generation, "sudo-cached-secret"
+    )
+    service.operation_trace.clear()
+    service.next_reload_error = PostMutationVerificationError(
+        "web01", "reload_firewalld"
+    )
+    requests: list[object] = []
+    failures: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+
+    handle = controller.reload_firewalld("web01")
+    handle.failed.connect(
+        lambda _server_id, _generation, _operation, error: failures.append(error)
+    )
+    scheduler.pending("web01", "reload_firewalld").run()
+
+    assert service.reload_calls == [
+        (ApplyTarget.BOTH, "sudo-cached-secret"),
+    ]
+    assert service.operation_trace == ["reload_firewalld"]
+    assert requests == []
+    assert len(failures) == 1
+    assert failures[0].category == "post_mutation_verification"
+    assert failures[0].message == (
+        "Firewalld reloaded, but its running state could not be verified."
+    )
+    assert "secret" not in repr(failures[0])
+    assert not hasattr(failures[0], "raw_error")
+    view = controller.session_view("web01")
+    assert view.status is ConnectionStatus.CONNECTED
+    assert view.snapshot is not None and view.snapshot.stale
+
+    service.next_snapshot = make_snapshot(server_id="web01", default_zone="internal")
+    controller.refresh("web01")
+    scheduler.pending("web01", "refresh").run()
+    assert service.load_calls[-1] is None
+    assert len(service.reload_calls) == 1

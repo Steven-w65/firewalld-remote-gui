@@ -200,6 +200,28 @@ def test_normal_confirmation_still_defaults_to_cancel(qtbot):
             "session memory",
             "error",
         ),
+        (
+            ControllerOperationError(
+                "web01",
+                "reload_firewalld",
+                "post_mutation_verification",
+                "unsafe-secret raw verification error",
+            ),
+            "Reload Verification Incomplete",
+            "could not be verified",
+            "warning",
+        ),
+        (
+            ControllerOperationError(
+                "web01",
+                "reload_firewalld",
+                "post_mutation_refresh",
+                "unsafe-secret raw refresh error",
+            ),
+            "Reload Completed; Refresh Failed",
+            "data is stale",
+            "warning",
+        ),
     ],
 )
 def test_error_dialog_uses_only_fixed_sanitized_copy(

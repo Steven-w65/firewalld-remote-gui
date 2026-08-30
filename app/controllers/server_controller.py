@@ -25,6 +25,9 @@ from app.utils.errors import (
     FirewalldNotRunningError,
     HostKeyStoreError,
     PermissionDeniedError,
+    PostMutationError,
+    PostMutationRefreshError,
+    PostMutationVerificationError,
     SSHAuthenticationError,
     SSHConnectionError,
     SSHError,
@@ -524,7 +527,16 @@ class ServerController(QObject):
                 or not result.is_success
             ):
                 raise FirewallCommandError(server_id, "reload_firewalld")
-            return service.load_snapshot(sudo_password=sudo_password)
+            post_mutation_error: PostMutationRefreshError | None = None
+            try:
+                snapshot = service.load_snapshot(sudo_password=sudo_password)
+            except (SudoAuthenticationError, SudoAuthenticationRequiredError):
+                post_mutation_error = PostMutationRefreshError(
+                    server_id, "reload_firewalld"
+                )
+            if post_mutation_error is not None:
+                raise post_mutation_error
+            return snapshot
 
         return self._start_service_job(session, "reload_firewalld", work)
 
@@ -962,7 +974,10 @@ class ServerController(QObject):
         self, session: ServerSession, operation: str, error: object
     ) -> ControllerOperationError:
         public_error = self._public_error(session.config.id, operation, error)
-        if isinstance(error, (SSHAuthenticationError, SudoAuthenticationError)):
+        if isinstance(
+            error,
+            (SSHAuthenticationError, SudoAuthenticationError, PostMutationError),
+        ):
             session.sudo_password = None
         if isinstance(error, UnknownHostKeyError):
             session.status = ConnectionStatus.HOST_KEY_ERROR
@@ -995,6 +1010,8 @@ class ServerController(QObject):
                 )
                 self._pending_sudo[session.config.id] = _PendingSudo(request)
                 self.sudo_password_required.emit(session.config.id, request)
+        elif isinstance(error, PostMutationError):
+            self._pending_sudo.pop(session.config.id, None)
         elif isinstance(error, PermissionDeniedError):
             session.status = ConnectionStatus.PERMISSION_ERROR
         elif isinstance(error, FirewalldNotInstalledError):
@@ -1045,6 +1062,16 @@ class ServerController(QObject):
             category, message = "sudo_authentication", "Sudo authentication failed."
         elif isinstance(error, SudoAuthenticationRequiredError):
             category, message = "sudo_required", "Sudo authentication is required."
+        elif isinstance(error, PostMutationVerificationError):
+            category, message = (
+                "post_mutation_verification",
+                "Firewalld reloaded, but its running state could not be verified.",
+            )
+        elif isinstance(error, PostMutationRefreshError):
+            category, message = (
+                "post_mutation_refresh",
+                "Firewalld reloaded, but fresh firewall data could not be loaded.",
+            )
         elif isinstance(error, PermissionDeniedError):
             category, message = "permission", "The remote operation was not authorized."
         elif isinstance(error, FirewalldNotInstalledError):

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtWidgets import QDialog
+from PySide6.QtWidgets import QDialog, QLabel
 
 from app.controllers.server_controller import (
     ControllerJobHandle,
@@ -14,6 +14,7 @@ from app.controllers.server_controller import (
 )
 from app.controllers.session import ServerSessionView
 from app.firewalld.service import ConnectionCheck, ConnectionTestResult, FirewalldInfo
+from app.gui.dialogs.confirmation_dialog import ConfirmationDialog
 from app.gui.main_window import MainWindow
 from app.models.enums import ConnectionStatus
 from app.models.firewall import FirewallSnapshot
@@ -377,6 +378,31 @@ def test_reload_confirmation_is_cancel_default_and_cancel_submits_nothing(
     assert previews[0].operation == "Reload firewalld"
     assert previews[0].target.value == "both"
     assert not previews[0].risk.is_high
+    assert controller.reload_firewalld_calls == []
+
+
+def test_reload_confirmation_visibly_warns_runtime_only_changes_may_be_discarded(
+    window, controller, monkeypatch
+):
+    rendered_text: list[str] = []
+
+    class InspectingDialog(ConfirmationDialog):
+        def exec(self):
+            rendered_text.append(
+                " ".join(label.text() for label in self.findChildren(QLabel))
+            )
+            self.reject()
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr("app.gui.main_window.ConfirmationDialog", InspectingDialog)
+    window.server_sidebar.select_server("db01")
+
+    window.overview_tab.reload_button.click()
+
+    assert (
+        "loads the permanent configuration into runtime and may discard "
+        "runtime-only changes"
+    ) in rendered_text[0]
     assert controller.reload_firewalld_calls == []
 
 
