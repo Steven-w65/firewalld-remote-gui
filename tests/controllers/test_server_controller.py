@@ -11,7 +11,9 @@ from PySide6.QtCore import QThread
 from app.config.models import LoadedConfig
 from app.models.enums import ConnectionStatus
 from app.utils.errors import (
+    ChangedHostKeyError,
     ConfigurationError,
+    HostKeyStoreError,
     SSHAuthenticationError,
     SSHConnectionError,
     SudoAuthenticationError,
@@ -29,6 +31,14 @@ from tests.controllers.fakes import (
     make_snapshot,
     secrets_in,
 )
+
+
+class RecordingHostKeyStore:
+    def __init__(self) -> None:
+        self.trust_calls: list[object] = []
+
+    def trust(self, challenge: object) -> None:
+        self.trust_calls.append(challenge)
 
 
 @pytest.fixture
@@ -396,7 +406,7 @@ def test_sudo_required_emits_frozen_password_free_request(
     server_id, request = requests[0]
     assert server_id == "web01"
     assert request.server_id == "web01"
-    assert request.operation == "load_snapshot"
+    assert request.operation == "connect"
     assert not hasattr(request, "password")
     assert not secrets_in(request)
 
@@ -955,3 +965,266 @@ def test_shutdown_duplicate_cleanup_after_cancel_start_race_closes_once(
     assert manager.disconnect_thread is not controller.thread()
     assert ("web01", "shutdown_disconnect") in scheduler.submitted_operations
     assert controller._open_close_tokens("web01") == ()
+
+
+def test_confirmed_unknown_host_key_is_revalidated_trusted_then_freshly_connected(
+    qapp,
+) -> None:
+    from app.controllers.server_controller import ServerController
+
+    del qapp
+    config_manager = FakeConfigManager(make_loaded("web01"))
+    scheduler = ManualScheduler()
+    manager_factory = ManagerFactory()
+    service_factory = ServiceFactory()
+    host_keys = RecordingHostKeyStore()
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe-fingerprint",
+    )
+    manager_factory.next_errors["web01"] = UnknownHostKeyError(challenge)
+    controller = ServerController(
+        config_manager,
+        scheduler,
+        manager_factory,
+        service_factory,
+        host_key_store=host_keys,
+    )
+    requests: list[tuple[str, object]] = []
+    controller.host_key_required.connect(
+        lambda server_id, value: requests.append((server_id, value))
+    )
+
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    generation = controller.session_view("web01").generation
+
+    assert requests == [("web01", challenge)]
+    assert controller.resolve_host_key("web01", generation, challenge, True)
+    assert host_keys.trust_calls == [challenge]
+    assert controller.session_view("web01").generation == generation + 1
+    assert len(manager_factory.instances["web01"]) == 1
+
+    scheduler.pending("web01", "connect").run()
+    assert len(manager_factory.instances["web01"]) == 2
+    assert controller.session_view("web01").status is ConnectionStatus.CONNECTED
+
+
+def test_host_key_cancel_stale_or_mismatched_decision_never_trusts_or_reconnects(
+    qapp,
+) -> None:
+    from app.controllers.server_controller import ServerController
+
+    del qapp
+    config_manager = FakeConfigManager(make_loaded("web01"))
+    scheduler = ManualScheduler()
+    manager_factory = ManagerFactory()
+    host_keys = RecordingHostKeyStore()
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe-fingerprint",
+    )
+    manager_factory.next_errors["web01"] = UnknownHostKeyError(challenge)
+    controller = ServerController(
+        config_manager,
+        scheduler,
+        manager_factory,
+        ServiceFactory(),
+        host_key_store=host_keys,
+    )
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    generation = controller.session_view("web01").generation
+    initial_jobs = len(scheduler.handles)
+
+    assert not controller.resolve_host_key("web01", generation, challenge, False)
+    assert not controller.resolve_host_key(
+        "web01",
+        generation,
+        SimpleNamespace(**vars(challenge)),
+        True,
+    )
+    assert not controller.resolve_host_key("web01", generation - 1, challenge, True)
+    assert host_keys.trust_calls == []
+    assert len(scheduler.handles) == initial_jobs
+
+
+def test_host_key_store_failure_is_sanitized_and_never_reconnects(qapp) -> None:
+    from app.controllers.server_controller import ServerController
+
+    del qapp
+    config_manager = FakeConfigManager(make_loaded("web01"))
+    scheduler = ManualScheduler()
+    manager_factory = ManagerFactory()
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe-fingerprint",
+    )
+    manager_factory.next_errors["web01"] = UnknownHostKeyError(challenge)
+
+    class FailingHostKeyStore:
+        def trust(self, _challenge: object) -> None:
+            raise HostKeyStoreError()
+
+    controller = ServerController(
+        config_manager,
+        scheduler,
+        manager_factory,
+        ServiceFactory(),
+        host_key_store=FailingHostKeyStore(),
+    )
+    errors: list[object] = []
+    controller.error_raised.connect(lambda _server, error: errors.append(error))
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    generation = controller.session_view("web01").generation
+    initial_jobs = len(scheduler.handles)
+
+    assert not controller.resolve_host_key("web01", generation, challenge, True)
+    assert len(scheduler.handles) == initial_jobs
+    assert errors[-1].category == "host_key_store"
+    assert "known_hosts" not in errors[-1].message
+
+
+def test_changed_host_key_never_emits_a_trust_capable_request(controller, dependencies):
+    _, scheduler, manager_factory, _ = dependencies
+    manager_factory.next_errors["web01"] = ChangedHostKeyError(
+        "web01.example.test", 22, "SHA256:expected", "SHA256:actual"
+    )
+    trust_requests: list[object] = []
+    errors: list[object] = []
+    controller.host_key_required.connect(lambda _server, value: trust_requests.append(value))
+    controller.error_raised.connect(lambda _server, error: errors.append(error))
+
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+
+    assert trust_requests == []
+    assert errors[-1].category == "host_key_changed"
+    assert "SHA256" not in errors[-1].message
+
+
+def test_sudo_acceptance_retries_exact_connect_once_with_memory_only_password(
+    controller, dependencies
+) -> None:
+    _, scheduler, manager_factory, service_factory = dependencies
+    service_factory.next_load_errors["web01"] = SudoAuthenticationRequiredError(
+        "web01", "load_snapshot"
+    )
+    requests: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.operation == "connect"
+    assert not hasattr(request, "password")
+    assert controller.resolve_sudo_password(request, "sudo-web-secret")
+    retry_handle = scheduler.pending("web01", "connect")
+    assert retry_handle.generation == request.generation + 1
+    assert "secret" not in repr(retry_handle)
+
+    retry_handle.run()
+    assert len(manager_factory.instances["web01"]) == 2
+    assert service_factory.instances["web01"][1].load_calls == ["sudo-web-secret"]
+    assert controller.session_view("web01").status is ConnectionStatus.CONNECTED
+
+
+def test_sudo_cancel_wrong_request_and_stale_generation_do_not_store_or_retry(
+    controller, dependencies
+) -> None:
+    from app.controllers.server_controller import SudoPasswordRequest
+
+    _, scheduler, _, service_factory = dependencies
+    service_factory.next_load_errors["web01"] = SudoAuthenticationRequiredError(
+        "web01", "load_snapshot"
+    )
+    requests: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    request = requests[0]
+    initial_jobs = len(scheduler.handles)
+
+    assert not controller.resolve_sudo_password(
+        SudoPasswordRequest(request.server_id, request.generation, "refresh"),
+        "sudo-wrong-secret",
+    )
+    assert not controller.resolve_sudo_password(
+        SudoPasswordRequest(request.server_id, request.generation - 1, request.operation),
+        "sudo-stale-secret",
+    )
+    assert not controller.resolve_sudo_password(request, None)
+    assert len(scheduler.handles) == initial_jobs
+
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    assert service_factory.instances["web01"][1].load_calls == [None]
+
+
+def test_sudo_authentication_failure_clears_cache_and_never_prompts_in_a_loop(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    service_factory.next_load_errors["web01"] = SudoAuthenticationRequiredError(
+        "web01", "load_snapshot"
+    )
+    requests: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    request = requests[0]
+    service_factory.next_load_errors["web01"] = SudoAuthenticationError(
+        "web01", "load_snapshot"
+    )
+
+    assert controller.resolve_sudo_password(request, "sudo-bad-secret")
+    scheduler.pending("web01", "connect").run()
+
+    assert len(requests) == 1
+    assert controller.session_view("web01").status is ConnectionStatus.PERMISSION_ERROR
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    assert service_factory.instances["web01"][2].load_calls == [None]
+
+
+def test_sudo_refresh_retry_uses_same_generation_and_exact_logical_operation(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    service.next_load_error = SudoAuthenticationRequiredError(
+        "web01", "list_runtime_zones"
+    )
+    requests: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+
+    controller.refresh("web01")
+    scheduler.pending("web01", "refresh").run()
+    request = requests[0]
+    assert request.operation == "refresh"
+    assert controller.resolve_sudo_password(request, "sudo-web-secret")
+
+    retry = scheduler.pending("web01", "refresh")
+    assert retry.generation == request.generation
+    retry.run()
+    assert service.load_calls == [None, None, "sudo-web-secret"]
+    assert controller.session_view("web01").status is ConnectionStatus.CONNECTED

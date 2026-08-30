@@ -77,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _PreparedConfigManager(config_manager, loaded),
         scheduler,
         manager_factory,
+        host_key_store=host_key_store,
     )
     window = MainWindow(controller)
     window.show()

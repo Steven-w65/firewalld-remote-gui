@@ -69,8 +69,20 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
             return loaded_config()
 
     class FakeController:
-        def __init__(self, config_manager, scheduler, manager_factory):
-            calls["controller"] = (config_manager, scheduler, manager_factory)
+        def __init__(
+            self,
+            config_manager,
+            scheduler,
+            manager_factory,
+            *,
+            host_key_store,
+        ):
+            calls["controller"] = (
+                config_manager,
+                scheduler,
+                manager_factory,
+                host_key_store,
+            )
             self.loaded = config_manager.load()
 
     class FakeWindow:
@@ -121,7 +133,8 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
     assert window.show_calls == 1
     assert window.shutdown_calls == 1
     server = controller.loaded.servers[0]
-    _, _, manager_factory = calls["controller"]
+    _, _, manager_factory, controller_host_keys = calls["controller"]
+    assert controller_host_keys == known_hosts_file
     monkeypatch.setattr(
         main,
         "SSHManager",

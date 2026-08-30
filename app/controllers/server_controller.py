@@ -22,6 +22,7 @@ from app.utils.errors import (
     FirewallParseError,
     FirewalldNotInstalledError,
     FirewalldNotRunningError,
+    HostKeyStoreError,
     PermissionDeniedError,
     SSHAuthenticationError,
     SSHConnectionError,
@@ -52,6 +53,10 @@ class _Service(Protocol):
     def connection_test(
         self, *, sudo_password: str | None = None
     ) -> ConnectionTestResult: ...
+
+
+class _HostKeyStore(Protocol):
+    def trust(self, challenge: object) -> None: ...
 
 
 class _Scheduler(Protocol):
@@ -206,6 +211,19 @@ class _PublicJobRecord:
     public: ControllerJobHandle
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingHostKey:
+    server_id: str
+    generation: int
+    operation: str
+    challenge: object
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingSudo:
+    request: SudoPasswordRequest
+
+
 class ServerController(QObject):
     """Own isolated mutable sessions while publishing frozen state copies."""
 
@@ -222,12 +240,15 @@ class ServerController(QObject):
         scheduler: _Scheduler,
         manager_factory: ManagerFactory,
         service_factory: ServiceFactory = FirewalldService,
+        *,
+        host_key_store: _HostKeyStore | None = None,
     ) -> None:
         super().__init__()
         self._config_manager = config_manager
         self._scheduler = scheduler
         self._manager_factory = manager_factory
         self._service_factory = service_factory
+        self._host_key_store = host_key_store
         self._loaded = config_manager.load()
         self._sessions: dict[str, ServerSession] = {
             config.id: ServerSession(config=config)
@@ -240,6 +261,10 @@ class ServerController(QObject):
         self._private_close_handles: set[JobHandle[Any]] = set()
         self._close_token_lock = Lock()
         self._close_tokens: dict[str, dict[int, _ManagerCloseToken]] = {}
+        self._pending_host_keys: dict[str, _PendingHostKey] = {}
+        self._pending_sudo: dict[str, _PendingSudo] = {}
+        self._accepted_sudo_retries: set[SudoPasswordRequest] = set()
+        self._sudo_retry_jobs: set[tuple[str, int, str]] = set()
 
     @property
     def selected_server_id(self) -> str | None:
@@ -280,6 +305,75 @@ class ServerController(QObject):
         session.sudo_password = password
         return True
 
+    def resolve_host_key(
+        self,
+        server_id: str,
+        generation: int,
+        challenge: object,
+        confirmed: bool,
+    ) -> bool:
+        """Consume one exact unknown-key decision and reconnect only if trusted."""
+        pending = self._pending_host_keys.get(server_id)
+        if (
+            pending is None
+            or pending.generation != generation
+            or pending.challenge is not challenge
+        ):
+            return False
+        if not confirmed:
+            self._pending_host_keys.pop(server_id, None)
+            return False
+        session = self._sessions.get(server_id)
+        if (
+            session is None
+            or session.generation != generation
+            or session.config.host != getattr(challenge, "host", None)
+            or session.config.port != getattr(challenge, "port", None)
+            or self._host_key_store is None
+        ):
+            self._pending_host_keys.pop(server_id, None)
+            return False
+
+        self._pending_host_keys.pop(server_id, None)
+        try:
+            self._host_key_store.trust(challenge)
+        except Exception as error:
+            self._apply_failure(session, pending.operation, error)
+            return False
+        self._restart_connection(session, pending.operation, retried_with_sudo=False)
+        return True
+
+    def resolve_sudo_password(
+        self, request: SudoPasswordRequest, password: str | None
+    ) -> bool:
+        """Consume one exact password request and retry its logical operation once."""
+        if not isinstance(request, SudoPasswordRequest):
+            return False
+        pending = self._pending_sudo.get(request.server_id)
+        if pending is None or pending.request is not request:
+            return False
+        session = self._sessions.get(request.server_id)
+        if (
+            session is None
+            or session.generation != request.generation
+            or not session.config.sudo
+            or session.status is ConnectionStatus.DISCONNECTED
+        ):
+            self._pending_sudo.pop(request.server_id, None)
+            return False
+        if not isinstance(password, str) or not password:
+            self._pending_sudo.pop(request.server_id, None)
+            return False
+
+        session.sudo_password = password
+        self._pending_sudo.pop(request.server_id, None)
+        key = (request.server_id, request.generation, request.operation)
+        if key in self._jobs:
+            self._accepted_sudo_retries.add(request)
+        else:
+            self._retry_sudo_operation(request)
+        return True
+
     def connect(self, server_id: str) -> ControllerJobHandle:
         session = self._session(server_id)
         allowed = {
@@ -292,6 +386,7 @@ class ServerController(QObject):
             ConnectionStatus.FIREWALLD_NOT_RUNNING,
         }
         self._require_state(session, "connect", allowed, require_idle=True)
+        self._clear_pending_decisions(server_id)
         if session._ssh_manager is not None or session._service is not None:
             raise RuntimeError(
                 f"Cannot connect server '{server_id}' while it owns a live session; "
@@ -315,6 +410,7 @@ class ServerController(QObject):
         session = self._session(server_id)
         if session.status is ConnectionStatus.DISCONNECTED:
             raise RuntimeError(f"Cannot disconnect server '{server_id}' while disconnected.")
+        self._clear_pending_decisions(server_id)
         attempt_manager = self._invalidate_attempt(session)
         manager = cast(_Manager | None, session._ssh_manager)
         self._register_close_tokens(server_id, manager, attempt_manager)
@@ -340,6 +436,7 @@ class ServerController(QObject):
             set(ConnectionStatus) - {ConnectionStatus.DISCONNECTED},
             require_idle=True,
         )
+        self._clear_pending_decisions(server_id)
         attempt_manager = self._invalidate_attempt(session)
         old_manager = cast(_Manager | None, session._ssh_manager)
         self._register_close_tokens(server_id, old_manager, attempt_manager)
@@ -390,6 +487,7 @@ class ServerController(QObject):
         old_sessions = self._sessions
         for server_id in (*diff.changed, *diff.removed):
             old = old_sessions[server_id]
+            self._clear_pending_decisions(server_id)
             attempt_manager = self._invalidate_attempt(old)
             manager = cast(_Manager | None, old._ssh_manager)
             self._register_close_tokens(server_id, manager, attempt_manager)
@@ -442,6 +540,7 @@ class ServerController(QObject):
             raise ValueError("timeout_ms must be non-negative")
         for server_id in self._order:
             session = self._sessions[server_id]
+            self._clear_pending_decisions(server_id)
             attempt_manager = self._invalidate_attempt(session)
             manager = cast(_Manager | None, session._ssh_manager)
             self._register_close_tokens(server_id, manager, attempt_manager)
@@ -474,6 +573,68 @@ class ServerController(QObject):
         self._jobs.clear()
         self._private_close_handles.clear()
         return drained and all_closed
+
+    def _restart_connection(
+        self,
+        session: ServerSession,
+        operation: str,
+        *,
+        retried_with_sudo: bool,
+    ) -> ControllerJobHandle:
+        generation = self._advance_generation(session)
+        session.status = ConnectionStatus.CONNECTING
+        session.latest_error = None
+        session.snapshot = None
+        session.busy_operation = operation
+        attempt = _ConnectionAttempt()
+        session._connection_attempt = attempt
+        if retried_with_sudo:
+            self._sudo_retry_jobs.add((session.config.id, generation, operation))
+        self.session_changed.emit(session.config.id)
+        return self._submit_connection(
+            session,
+            operation,
+            tokens_to_close=(),
+            attempt=attempt,
+        )
+
+    def _retry_sudo_operation(
+        self, request: SudoPasswordRequest
+    ) -> ControllerJobHandle | None:
+        session = self._sessions.get(request.server_id)
+        if session is None or session.generation != request.generation:
+            return None
+        if request.operation in {"connect", "reconnect"}:
+            return self._restart_connection(
+                session, request.operation, retried_with_sudo=True
+            )
+        if request.operation == "refresh":
+            if session._service is None:
+                return None
+            session.status = ConnectionStatus.CONNECTED
+            key = (request.server_id, request.generation, request.operation)
+            self._sudo_retry_jobs.add(key)
+            return self.refresh(request.server_id)
+        if request.operation == "test_connection":
+            if session._service is None:
+                return None
+            session.status = ConnectionStatus.CONNECTED
+            key = (request.server_id, request.generation, request.operation)
+            self._sudo_retry_jobs.add(key)
+            return self.test_connection(request.server_id)
+        return None
+
+    def _clear_pending_decisions(self, server_id: str) -> None:
+        self._pending_host_keys.pop(server_id, None)
+        self._pending_sudo.pop(server_id, None)
+        self._accepted_sudo_retries = {
+            request
+            for request in self._accepted_sudo_retries
+            if request.server_id != server_id
+        }
+        self._sudo_retry_jobs = {
+            key for key in self._sudo_retry_jobs if key[0] != server_id
+        }
 
     def _submit_connection(
         self,
@@ -658,6 +819,7 @@ class ServerController(QObject):
         record.public.succeeded.emit(
             server_id, generation, operation, public_value
         )
+        self._sudo_retry_jobs.discard((server_id, generation, operation))
 
     @Slot(str, int, str, object)
     def _on_failed(
@@ -677,6 +839,7 @@ class ServerController(QObject):
             return
         public_error = self._apply_failure(session, operation, error)
         record.public.failed.emit(server_id, generation, operation, public_error)
+        self._sudo_retry_jobs.discard((server_id, generation, operation))
 
     @Slot(str, int, str)
     def _on_finished(
@@ -690,6 +853,19 @@ class ServerController(QObject):
                 self.session_changed.emit(server_id)
         if record is not None:
             record.public.finished.emit(server_id, generation, operation)
+        request = next(
+            (
+                candidate
+                for candidate in self._accepted_sudo_retries
+                if candidate.server_id == server_id
+                and candidate.generation == generation
+                and candidate.operation == operation
+            ),
+            None,
+        )
+        if request is not None:
+            self._accepted_sudo_retries.discard(request)
+            self._retry_sudo_operation(request)
 
     def _apply_failure(
         self, session: ServerSession, operation: str, error: object
@@ -699,17 +875,35 @@ class ServerController(QObject):
             session.sudo_password = None
         if isinstance(error, UnknownHostKeyError):
             session.status = ConnectionStatus.HOST_KEY_ERROR
+            self._pending_sudo.pop(session.config.id, None)
+            self._pending_host_keys[session.config.id] = _PendingHostKey(
+                session.config.id,
+                session.generation,
+                operation,
+                error.challenge,
+            )
             self.host_key_required.emit(session.config.id, error.challenge)
         elif isinstance(error, ChangedHostKeyError):
             session.status = ConnectionStatus.HOST_KEY_ERROR
+            self._pending_host_keys.pop(session.config.id, None)
         elif isinstance(error, SSHAuthenticationError):
             session.status = ConnectionStatus.AUTHENTICATION_FAILED
+            self._pending_sudo.pop(session.config.id, None)
+        elif isinstance(error, SudoAuthenticationError):
+            session.status = ConnectionStatus.PERMISSION_ERROR
+            self._pending_sudo.pop(session.config.id, None)
         elif isinstance(error, SudoAuthenticationRequiredError):
             session.status = ConnectionStatus.PERMISSION_ERROR
-            request = SudoPasswordRequest(
-                session.config.id, session.generation, error.operation
-            )
-            self.sudo_password_required.emit(session.config.id, request)
+            key = (session.config.id, session.generation, operation)
+            if key in self._sudo_retry_jobs:
+                session.sudo_password = None
+                self._pending_sudo.pop(session.config.id, None)
+            else:
+                request = SudoPasswordRequest(
+                    session.config.id, session.generation, operation
+                )
+                self._pending_sudo[session.config.id] = _PendingSudo(request)
+                self.sudo_password_required.emit(session.config.id, request)
         elif isinstance(error, PermissionDeniedError):
             session.status = ConnectionStatus.PERMISSION_ERROR
         elif isinstance(error, FirewalldNotInstalledError):
@@ -771,6 +965,11 @@ class ServerController(QObject):
             category, message = "firewalld", "The firewalld operation failed."
         elif isinstance(error, SystemProbeError):
             category, message = "system_probe", "The remote system probe failed."
+        elif isinstance(error, HostKeyStoreError):
+            category, message = (
+                "host_key_store",
+                "The SSH trust store could not be updated safely.",
+            )
         else:
             category, message = "operation", "The remote operation failed."
         return ControllerOperationError(server_id, operation, category, message)

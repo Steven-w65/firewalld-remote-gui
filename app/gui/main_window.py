@@ -15,8 +15,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.controllers.server_controller import ServerController
+from app.controllers.server_controller import (
+    ControllerOperationError,
+    ServerController,
+    SudoPasswordRequest,
+)
 from app.controllers.session import ServerSessionView
+from app.gui.dialogs import ErrorDialog, HostKeyDialog, SudoPasswordDialog
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
 
@@ -103,6 +108,11 @@ class MainWindow(QMainWindow):
         self._controller.sessions_changed.connect(self._sessions_changed)
         self._controller.selection_changed.connect(self._selection_changed)
         self._controller.session_changed.connect(self._session_changed)
+        self._controller.host_key_required.connect(self._host_key_required)
+        self._controller.sudo_password_required.connect(
+            self._sudo_password_required
+        )
+        self._controller.error_raised.connect(self._error_raised)
 
         self._sessions_changed()
 
@@ -136,6 +146,48 @@ class MainWindow(QMainWindow):
     def _refresh_selected(self) -> None:
         if self.current_server_id is not None:
             self._controller.refresh(self.current_server_id)
+
+    @Slot(str, object)
+    def _host_key_required(self, server_id: str, challenge: object) -> None:
+        try:
+            generation = self._controller.session_view(server_id).generation
+        except KeyError:
+            return
+        dialog = HostKeyDialog(challenge, self)
+        dialog.exec()
+        self._controller.resolve_host_key(
+            server_id,
+            generation,
+            challenge,
+            dialog.confirmed(),
+        )
+
+    @Slot(str, object)
+    def _sudo_password_required(self, server_id: str, request: object) -> None:
+        if not isinstance(request, SudoPasswordRequest):
+            return
+        try:
+            view = self._controller.session_view(server_id)
+        except KeyError:
+            return
+        if request.server_id != server_id or request.generation != view.generation:
+            self._controller.resolve_sudo_password(request, None)
+            return
+        dialog = SudoPasswordDialog(view.name, self)
+        dialog.exec()
+        password = dialog.take_password() if dialog.confirmed() else None
+        self._controller.resolve_sudo_password(request, password)
+        password = None
+
+    @Slot(str, object)
+    def _error_raised(self, server_id: str, error: object) -> None:
+        del server_id
+        if isinstance(error, ControllerOperationError) and error.category in {
+            "host_key_required",
+            "sudo_required",
+        }:
+            return
+        ErrorDialog.from_domain_error(error, self).exec()
 
     def _render_selected(self) -> None:
         view = self._selected_view()

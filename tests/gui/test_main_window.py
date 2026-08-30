@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtWidgets import QDialog
 
+from app.controllers.server_controller import ControllerOperationError, SudoPasswordRequest
 from app.controllers.session import ServerSessionView
 from app.gui.main_window import MainWindow
 from app.models.enums import ConnectionStatus
@@ -74,6 +77,8 @@ class FakeServerController(QObject):
         self.refresh_calls: list[str] = []
         self.reload_calls = 0
         self.shutdown_calls: list[int] = []
+        self.host_key_decisions: list[tuple[str, int, object, bool]] = []
+        self.sudo_decisions: list[tuple[object, str | None]] = []
 
     def sessions(self) -> tuple[ServerSessionView, ...]:
         return tuple(self._views[server_id] for server_id in self._order)
@@ -100,6 +105,20 @@ class FakeServerController(QObject):
     def shutdown(self, timeout_ms: int = 5000) -> bool:
         self.shutdown_calls.append(timeout_ms)
         return True
+
+    def resolve_host_key(
+        self, server_id: str, generation: int, challenge: object, confirmed: bool
+    ) -> bool:
+        self.host_key_decisions.append(
+            (server_id, generation, challenge, confirmed)
+        )
+        return confirmed
+
+    def resolve_sudo_password(
+        self, request: object, password: str | None
+    ) -> bool:
+        self.sudo_decisions.append((request, password))
+        return password is not None
 
     def publish(self, replacement: ServerSessionView) -> None:
         self._views[replacement.server_id] = replacement
@@ -290,3 +309,116 @@ def test_shutdown_is_bounded_and_invoked_exactly_once(window, controller):
 
     assert controller.shutdown_calls == [5000]
 
+
+def test_unknown_host_signal_uses_gui_thread_dialog_and_exact_decision(
+    window, controller, monkeypatch
+):
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe",
+    )
+    dialog_threads: list[object] = []
+
+    class AcceptingHostDialog:
+        def __init__(self, received, parent):
+            assert received is challenge
+            assert parent is window
+            dialog_threads.append(QThread.currentThread())
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr("app.gui.main_window.HostKeyDialog", AcceptingHostDialog)
+
+    controller.host_key_required.emit("web01", challenge)
+
+    assert dialog_threads == [window.thread()]
+    assert controller.host_key_decisions == [("web01", 0, challenge, True)]
+
+
+def test_closed_sudo_dialog_cancels_exact_waiting_request(
+    window, controller, monkeypatch
+):
+    request = SudoPasswordRequest("web01", 0, "refresh")
+
+    class ClosingSudoDialog:
+        def __init__(self, server_name, parent):
+            assert server_name == "Production Web"
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+        def confirmed(self):
+            return False
+
+        def take_password(self):
+            raise AssertionError("cancelled dialog must not transfer a password")
+
+    monkeypatch.setattr("app.gui.main_window.SudoPasswordDialog", ClosingSudoDialog)
+
+    controller.sudo_password_required.emit("web01", request)
+
+    assert controller.sudo_decisions == [(request, None)]
+
+
+def test_accepted_sudo_dialog_transfers_secret_once_without_widget_or_signal_copy(
+    window, controller, monkeypatch
+):
+    request = SudoPasswordRequest("web01", 0, "refresh")
+    takes = 0
+
+    class AcceptingSudoDialog:
+        def __init__(self, server_name, parent):
+            assert server_name == "Production Web"
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+        def take_password(self):
+            nonlocal takes
+            takes += 1
+            return "sudo-secret"
+
+    monkeypatch.setattr("app.gui.main_window.SudoPasswordDialog", AcceptingSudoDialog)
+
+    controller.sudo_password_required.emit("web01", request)
+
+    assert takes == 1
+    assert controller.sudo_decisions == [(request, "sudo-secret")]
+    assert "sudo-secret" not in window.statusBar().currentMessage()
+
+
+def test_changed_key_error_opens_only_fixed_error_dialog_on_gui_thread(
+    window, controller, monkeypatch
+):
+    error = ControllerOperationError(
+        "web01", "connect", "host_key_changed", "unsafe-secret-host-data"
+    )
+    captured: list[tuple[object, object]] = []
+
+    class CapturingErrorDialog:
+        @classmethod
+        def from_domain_error(cls, received, parent=None):
+            captured.append((received, QThread.currentThread()))
+            assert parent is window
+            return cls()
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr("app.gui.main_window.ErrorDialog", CapturingErrorDialog)
+
+    controller.error_raised.emit("web01", error)
+
+    assert captured == [(error, window.thread())]
+    assert controller.host_key_decisions == []
