@@ -70,6 +70,7 @@ class _CancellationObservingScheduler(OperationScheduler):
         self._observation_lock = Lock()
         self.cancelled_ids: list[str] = []
         self.submitted_operations: list[tuple[str, str]] = []
+        self.web_cancelled = Event()
         self.second_web_cancel = Event()
 
     def submit(self, server_id, generation, operation, work):
@@ -80,6 +81,8 @@ class _CancellationObservingScheduler(OperationScheduler):
     def cancel_pending(self, server_id: str) -> None:
         with self._observation_lock:
             self.cancelled_ids.append(server_id)
+            if server_id == "web01":
+                self.web_cancelled.set()
             if self.cancelled_ids.count("web01") >= 2:
                 self.second_web_cancel.set()
         super().cancel_pending(server_id)
@@ -1010,6 +1013,279 @@ def test_confirmed_unknown_host_key_is_revalidated_trusted_then_freshly_connecte
     scheduler.pending("web01", "connect").run()
     assert len(manager_factory.instances["web01"]) == 2
     assert controller.session_view("web01").status is ConnectionStatus.CONNECTED
+
+
+def _emit_unknown_host_failure_with_inline_trust(
+    controller,
+    scheduler: ManualScheduler,
+    challenge: object,
+) -> tuple[object, object, list[bool]]:
+    resolutions: list[bool] = []
+    controller.host_key_required.connect(
+        lambda server_id, received: resolutions.append(
+            controller.resolve_host_key(
+                server_id,
+                controller.session_view(server_id).generation,
+                received,
+                True,
+            )
+        )
+    )
+    public = controller.connect("web01")
+    original = scheduler.pending("web01", "connect")
+    original.has_run = True
+    original.emit_started()
+    with pytest.raises(UnknownHostKeyError) as raised:
+        original.work()
+    assert raised.value.challenge is challenge
+    original.emit_failed(raised.value)
+    return original, public, resolutions
+
+
+def test_inline_host_key_acceptance_defers_one_fresh_connect_until_original_finish(
+    qapp,
+) -> None:
+    from app.controllers.server_controller import ServerController
+
+    del qapp
+    scheduler = ManualScheduler()
+    manager_factory = ManagerFactory()
+    host_keys = RecordingHostKeyStore()
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe-fingerprint",
+    )
+    manager_factory.next_errors["web01"] = UnknownHostKeyError(challenge)
+    controller = ServerController(
+        FakeConfigManager(make_loaded("web01")),
+        scheduler,
+        manager_factory,
+        ServiceFactory(),
+        host_key_store=host_keys,
+    )
+
+    original, public, resolutions = _emit_unknown_host_failure_with_inline_trust(
+        controller, scheduler, challenge
+    )
+
+    assert resolutions == [True]
+    assert host_keys.trust_calls == [challenge]
+    assert [handle.operation for handle in scheduler.handles] == ["connect"]
+    assert controller.session_view("web01").generation == 0
+    assert not controller.resolve_host_key("web01", 0, challenge, True)
+    finished_job_counts: list[int] = []
+    public.finished.connect(
+        lambda *_event: finished_job_counts.append(len(scheduler.handles))
+    )
+
+    original.emit_finished()
+
+    assert finished_job_counts == [1]
+    assert [handle.operation for handle in scheduler.handles] == [
+        "connect",
+        "connect",
+    ]
+    view = controller.session_view("web01")
+    assert view.generation == 1
+    assert view.status is ConnectionStatus.CONNECTING
+    assert view.latest_error is None
+    retry_attempt = controller._sessions["web01"]._connection_attempt
+    assert retry_attempt is not None
+
+    original.emit_finished()
+    assert len(scheduler.handles) == 2
+    assert controller._sessions["web01"]._connection_attempt is retry_attempt
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        "disconnect",
+        "reconnect",
+        "reload_changed",
+        "reload_removed",
+        "shutdown",
+        "selection",
+    ],
+)
+def test_lifecycle_before_original_finish_cancels_trusted_retry(
+    qapp, lifecycle: str
+) -> None:
+    from app.controllers.server_controller import ServerController
+
+    del qapp
+    scheduler = ManualScheduler()
+    manager_factory = ManagerFactory()
+    host_keys = RecordingHostKeyStore()
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe-fingerprint",
+    )
+    manager_factory.next_errors["web01"] = UnknownHostKeyError(challenge)
+    config_manager = FakeConfigManager(make_loaded("web01", "db01"))
+    controller = ServerController(
+        config_manager,
+        scheduler,
+        manager_factory,
+        ServiceFactory(),
+        host_key_store=host_keys,
+    )
+    original, _public, resolutions = _emit_unknown_host_failure_with_inline_trust(
+        controller, scheduler, challenge
+    )
+    assert resolutions == [True]
+    assert host_keys.trust_calls == [challenge]
+
+    if lifecycle == "disconnect":
+        controller.disconnect("web01")
+    elif lifecycle == "reconnect":
+        with pytest.raises(RuntimeError, match="while busy"):
+            controller.reconnect("web01")
+    elif lifecycle == "reload_changed":
+        config_manager.current = LoadedConfig(
+            config_manager.current.application,
+            (
+                make_server("web01", host="replacement.example.test"),
+                make_server("db01"),
+            ),
+        )
+        controller.reload_configuration()
+    elif lifecycle == "reload_removed":
+        config_manager.current = make_loaded("db01")
+        controller.reload_configuration()
+    elif lifecycle == "shutdown":
+        assert controller.shutdown(timeout_ms=100)
+    else:
+        controller.select("db01")
+
+    original.emit_finished()
+
+    assert sum(handle.operation == "connect" for handle in scheduler.handles) == 1
+
+
+def test_busy_reconnect_cancels_trusted_retry_without_consuming_sudo_request(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    service.next_load_error = SudoAuthenticationRequiredError(
+        "web01", "list_runtime_zones"
+    )
+    requests: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+    controller.refresh("web01")
+    refresh = scheduler.pending("web01", "refresh")
+    refresh.has_run = True
+    refresh.emit_started()
+    with pytest.raises(SudoAuthenticationRequiredError) as raised:
+        refresh.work()
+    refresh.emit_failed(raised.value)
+    request = requests[0]
+
+    with pytest.raises(RuntimeError, match="while busy"):
+        controller.reconnect("web01")
+
+    assert controller.resolve_sudo_password(request, "sudo-web-secret")
+
+
+def _real_controller_with_blocked_trusted_retry(qtbot):
+    from app.controllers.server_controller import ServerController
+
+    scheduler = _CancellationObservingScheduler()
+    manager_factory = ManagerFactory()
+    host_keys = RecordingHostKeyStore()
+    challenge = SimpleNamespace(
+        host="web01.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:safe-fingerprint",
+    )
+    manager_factory.next_errors["web01"] = UnknownHostKeyError(challenge)
+    fresh_entered = Event()
+    fresh_release = Event()
+    controller = ServerController(
+        FakeConfigManager(make_loaded("web01")),
+        scheduler,
+        manager_factory,
+        ServiceFactory(),
+        host_key_store=host_keys,
+    )
+
+    def trust_inline(server_id: str, received: object) -> None:
+        manager_factory.connect_entered[server_id] = fresh_entered
+        manager_factory.connect_release[server_id] = fresh_release
+        assert controller.resolve_host_key(
+            server_id,
+            controller.session_view(server_id).generation,
+            received,
+            True,
+        )
+
+    controller.host_key_required.connect(trust_inline)
+    controller.connect("web01")
+    qtbot.waitUntil(fresh_entered.is_set, timeout=3000)
+    qtbot.waitUntil(
+        lambda: len(manager_factory.instances["web01"]) == 2,
+        timeout=3000,
+    )
+    return controller, scheduler, manager_factory, fresh_release
+
+
+def test_disconnect_invalidates_blocked_trusted_connect_and_worker_closes_once(
+    qtbot,
+) -> None:
+    controller, scheduler, manager_factory, fresh_release = (
+        _real_controller_with_blocked_trusted_retry(qtbot)
+    )
+    fresh_manager = manager_factory.instances["web01"][1]
+
+    controller.disconnect("web01")
+    fresh_release.set()
+
+    assert scheduler.wait_for_done(3000)
+    if fresh_manager.disconnect_calls != 1:
+        pytest.fail(
+            "blocked trusted reconnect was not closed exactly once by its worker; "
+            f"disconnect calls: {fresh_manager.disconnect_calls}"
+        )
+    assert fresh_manager.disconnect_thread is not controller.thread()
+    assert controller.session_view("web01").status is ConnectionStatus.DISCONNECTED
+    assert controller._open_close_tokens("web01") == ()
+
+
+def test_shutdown_invalidates_blocked_trusted_connect_without_qt_callback_cleanup(
+    qtbot,
+) -> None:
+    controller, scheduler, manager_factory, fresh_release = (
+        _real_controller_with_blocked_trusted_retry(qtbot)
+    )
+    fresh_manager = manager_factory.instances["web01"][1]
+
+    def release_after_shutdown_cancels() -> None:
+        assert scheduler.web_cancelled.wait(2)
+        fresh_release.set()
+
+    releaser = Thread(target=release_after_shutdown_cancels)
+    releaser.start()
+    assert controller.shutdown(timeout_ms=3000)
+    releaser.join(2)
+    assert not releaser.is_alive()
+
+    if fresh_manager.disconnect_calls != 1:
+        pytest.fail(
+            "shutdown relied on a Qt callback to close the trusted reconnect; "
+            f"disconnect calls: {fresh_manager.disconnect_calls}"
+        )
+    assert fresh_manager.disconnect_thread is not controller.thread()
+    assert controller._open_close_tokens("web01") == ()
 
 
 def test_host_key_cancel_stale_or_mismatched_decision_never_trusts_or_reconnects(

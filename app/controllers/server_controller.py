@@ -224,6 +224,15 @@ class _PendingSudo:
     request: SudoPasswordRequest
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingTrustedRetry:
+    server_id: str
+    generation: int
+    operation: str
+    host: str
+    port: int
+
+
 class ServerController(QObject):
     """Own isolated mutable sessions while publishing frozen state copies."""
 
@@ -263,6 +272,9 @@ class ServerController(QObject):
         self._close_tokens: dict[str, dict[int, _ManagerCloseToken]] = {}
         self._pending_host_keys: dict[str, _PendingHostKey] = {}
         self._pending_sudo: dict[str, _PendingSudo] = {}
+        self._pending_trusted_retries: dict[
+            tuple[str, int, str], _PendingTrustedRetry
+        ] = {}
         self._accepted_sudo_retries: set[SudoPasswordRequest] = set()
         self._sudo_retry_jobs: set[tuple[str, int, str]] = set()
 
@@ -284,6 +296,7 @@ class ServerController(QObject):
         self._session(server_id)
         if self._selected_server_id == server_id:
             return
+        self._pending_trusted_retries.clear()
         self._selected_server_id = server_id
         self.selection_changed.emit(server_id)
 
@@ -340,7 +353,17 @@ class ServerController(QObject):
         except Exception as error:
             self._apply_failure(session, pending.operation, error)
             return False
-        self._restart_connection(session, pending.operation, retried_with_sudo=False)
+        retry = _PendingTrustedRetry(
+            server_id,
+            generation,
+            pending.operation,
+            session.config.host,
+            session.config.port,
+        )
+        key = (server_id, generation, pending.operation)
+        self._pending_trusted_retries[key] = retry
+        if key not in self._jobs:
+            self._launch_trusted_retry(key)
         return True
 
     def resolve_sudo_password(
@@ -430,6 +453,7 @@ class ServerController(QObject):
 
     def reconnect(self, server_id: str) -> ControllerJobHandle:
         session = self._session(server_id)
+        self._clear_pending_trusted_retries(server_id)
         self._require_state(
             session,
             "reconnect",
@@ -627,6 +651,7 @@ class ServerController(QObject):
     def _clear_pending_decisions(self, server_id: str) -> None:
         self._pending_host_keys.pop(server_id, None)
         self._pending_sudo.pop(server_id, None)
+        self._clear_pending_trusted_retries(server_id)
         self._accepted_sudo_retries = {
             request
             for request in self._accepted_sudo_retries
@@ -634,6 +659,13 @@ class ServerController(QObject):
         }
         self._sudo_retry_jobs = {
             key for key in self._sudo_retry_jobs if key[0] != server_id
+        }
+
+    def _clear_pending_trusted_retries(self, server_id: str) -> None:
+        self._pending_trusted_retries = {
+            key: retry
+            for key, retry in self._pending_trusted_retries.items()
+            if retry.server_id != server_id
         }
 
     def _submit_connection(
@@ -853,6 +885,7 @@ class ServerController(QObject):
                 self.session_changed.emit(server_id)
         if record is not None:
             record.public.finished.emit(server_id, generation, operation)
+            self._launch_trusted_retry((server_id, generation, operation))
         request = next(
             (
                 candidate
@@ -866,6 +899,26 @@ class ServerController(QObject):
         if request is not None:
             self._accepted_sudo_retries.discard(request)
             self._retry_sudo_operation(request)
+
+    def _launch_trusted_retry(
+        self, key: tuple[str, int, str]
+    ) -> ControllerJobHandle | None:
+        retry = self._pending_trusted_retries.pop(key, None)
+        if retry is None:
+            return None
+        session = self._sessions.get(retry.server_id)
+        if (
+            session is None
+            or session.generation != retry.generation
+            or session.config.host != retry.host
+            or session.config.port != retry.port
+            or session.status is not ConnectionStatus.HOST_KEY_ERROR
+            or session.busy_operation is not None
+        ):
+            return None
+        return self._restart_connection(
+            session, retry.operation, retried_with_sudo=False
+        )
 
     def _apply_failure(
         self, session: ServerSession, operation: str, error: object
