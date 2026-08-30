@@ -94,6 +94,94 @@ def test_structured_rich_port_rule_chooses_ipv6_and_is_removable():
 
 
 @pytest.mark.parametrize(
+    ("method", "arguments", "expected"),
+    [
+        (
+            "add_rich_rule",
+            ("public", None, None, "ssh", None, None, "accept", False),
+            (
+                "firewall-cmd",
+                "--zone=public",
+                '--add-rich-rule=rule service name="ssh" accept',
+            ),
+        ),
+        (
+            "add_rich_rule",
+            ("public", None, None, "ssh", None, None, "accept", True),
+            (
+                "firewall-cmd",
+                "--permanent",
+                "--zone=public",
+                '--add-rich-rule=rule service name="ssh" accept',
+            ),
+        ),
+        (
+            "remove_rich_rule",
+            ("public", None, None, "ssh", None, None, "drop", False),
+            (
+                "firewall-cmd",
+                "--zone=public",
+                '--remove-rich-rule=rule service name="ssh" drop',
+            ),
+        ),
+        (
+            "remove_rich_rule",
+            ("public", None, None, "ssh", None, None, "drop", True),
+            (
+                "firewall-cmd",
+                "--permanent",
+                "--zone=public",
+                '--remove-rich-rule=rule service name="ssh" drop',
+            ),
+        ),
+        (
+            "add_rich_rule",
+            ("public", None, None, None, "8443", "TCP", "accept", False),
+            (
+                "firewall-cmd",
+                "--zone=public",
+                '--add-rich-rule=rule port port="8443" protocol="tcp" accept',
+            ),
+        ),
+        (
+            "add_rich_rule",
+            ("public", None, None, None, "8443", "TCP", "accept", True),
+            (
+                "firewall-cmd",
+                "--permanent",
+                "--zone=public",
+                '--add-rich-rule=rule port port="8443" protocol="tcp" accept',
+            ),
+        ),
+        (
+            "remove_rich_rule",
+            ("public", None, None, None, "53", "udp", "reject", False),
+            (
+                "firewall-cmd",
+                "--zone=public",
+                '--remove-rich-rule=rule port port="53" protocol="udp" reject',
+            ),
+        ),
+        (
+            "remove_rich_rule",
+            ("public", None, None, None, "53", "udp", "reject", True),
+            (
+                "firewall-cmd",
+                "--permanent",
+                "--zone=public",
+                '--remove-rich-rule=rule port port="53" protocol="udp" reject',
+            ),
+        ),
+    ],
+)
+def test_addressless_structured_rich_rules_have_exact_runtime_and_permanent_arguments(
+    method, arguments, expected
+):
+    """Catches requiring an address or emitting a meaningless family clause."""
+    assert getattr(Builder, method)(*arguments).argv == expected
+
+
+@pytest.mark.parametrize(
     "call",
     [
         lambda: Builder.add_port("public; id", "22", "tcp", False),
@@ -103,6 +191,7 @@ def test_structured_rich_port_rule_chooses_ipv6_and_is_removable():
         lambda: Builder.change_interface_zone("abcdefghijklmnopq", "public", False),
         lambda: Builder.set_default_zone("trusted;id"),
         lambda: Builder.add_rich_rule("public", "192.0.2.0/24;id", None, "ssh", None, None, "accept", False),
+        lambda: Builder.add_rich_rule("public", None, None, "ssh;id", None, None, "accept", False),
     ],
 )
 def test_builders_reject_injection_shaped_components_before_argv_construction(call):
@@ -118,7 +207,6 @@ def test_builders_reject_injection_shaped_components_before_argv_construction(ca
         ("ssh", None, "tcp", "192.0.2.0/24", None),
         (None, "22", None, "192.0.2.0/24", None),
         ("ssh", None, None, "192.0.2.0/24", "2001:db8::/64"),
-        ("ssh", None, None, None, None),
     ],
 )
 def test_rich_rules_reject_ambiguous_or_unsafe_structures(service, port, protocol, source, destination):

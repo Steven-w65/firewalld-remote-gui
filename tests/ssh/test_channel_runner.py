@@ -185,7 +185,9 @@ def test_fragmented_sudo_stderr_is_reassembled_before_classification(tmp_path):
     """Catches returning before a canonical sudo diagnostic is fully buffered."""
     clock = FakeClock()
     key = paramiko.RSAKey.generate(1024)
-    server = ServerConfig("edge-1", "Edge", "edge.test", "operator", "ssh-secret")
+    server = ServerConfig(
+        "edge-1", "Edge", "edge.test", "operator", "ssh-secret", sudo=True
+    )
     store = HostKeyStore(tmp_path / "known_hosts")
     store.trust(store.challenge(server.host, server.port, key))
     client = FakeSSHClient(key, clock=clock)

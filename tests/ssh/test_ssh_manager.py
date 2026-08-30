@@ -33,6 +33,7 @@ def server_config() -> ServerConfig:
         username="operator",
         password="ssh-secret",
         port=2222,
+        sudo=True,
     )
 
 
@@ -261,15 +262,27 @@ def test_supplied_sudo_password_uses_only_closed_channel_stdin(
 
 
 @pytest.mark.parametrize(
-    ("username", "requires_privilege"),
-    [("root", True), ("operator", False)],
+    ("username", "sudo_enabled", "requires_privilege"),
+    [
+        ("root", False, True),
+        ("root", True, True),
+        ("operator", False, True),
+        ("operator", True, False),
+    ],
 )
+@pytest.mark.parametrize("sudo_password", [None, "unused-sudo-secret"])
 def test_root_and_unprivileged_specs_bypass_sudo(
-    server_config, host_key_store, fake_client, username, requires_privilege
+    server_config,
+    host_key_store,
+    fake_client,
+    username,
+    sudo_enabled,
+    requires_privilege,
+    sudo_password,
 ):
-    """Catches unnecessary sudo and accidental credential writes on bypass paths."""
+    """Catches profile/user bypass paths invoking sudo or writing credentials."""
     manager = SSHManager(
-        replace(server_config, username=username),
+        replace(server_config, username=username, sudo=sudo_enabled),
         host_key_store,
         client_factory=lambda: fake_client,
     )
@@ -278,11 +291,40 @@ def test_root_and_unprivileged_specs_bypass_sudo(
 
     manager.execute_command(
         CommandSpec("probe", ("printf", "%s", "a value; id"), requires_privilege),
-        "unused-sudo-secret",
+        sudo_password,
     )
 
     assert fake_client.commands == ["printf %s 'a value; id'"]
     assert fake_client.stdin_writes == []
+    assert "unused-sudo-secret" not in repr(vars(manager))
+
+
+def test_sudo_disabled_profile_sanitizes_an_ignored_supplied_password(
+    server_config, host_key_store, fake_client
+):
+    """Catches an ignored sudo credential escaping through direct-command output."""
+    manager = SSHManager(
+        replace(server_config, sudo=False),
+        host_key_store,
+        client_factory=lambda: fake_client,
+    )
+    manager.connect()
+    fake_client.queue_result(
+        2,
+        "remote echoed ignored-sudo-secret",
+        "failure near ignored-sudo-secret",
+    )
+
+    result = manager.execute_command(
+        CommandSpec("state", ("firewall-cmd", "--state"), True),
+        "ignored-sudo-secret",
+    )
+
+    assert fake_client.commands == ["firewall-cmd --state"]
+    assert fake_client.stdin_writes == []
+    assert result.stdout == "remote echoed [REDACTED]"
+    assert result.stderr == "failure near [REDACTED]"
+    assert "ignored-sudo-secret" not in repr(result)
 
 
 def test_bad_sudo_password_maps_to_safe_typed_error(connected_manager, fake_client):

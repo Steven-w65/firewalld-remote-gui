@@ -183,7 +183,11 @@ class SSHManager:
         if transport is None:
             raise SSHConnectionError(self._server.id, "not connected")
 
-        use_sudo = spec.requires_privilege and self._server.username != "root"
+        use_sudo = (
+            spec.requires_privilege
+            and self._server.sudo
+            and self._server.username != "root"
+        )
         stdin_data: bytes | None = None
         if not use_sudo:
             command = render_command(spec)

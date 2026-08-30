@@ -171,14 +171,15 @@ class FirewalldCommandBuilder:
         normalized_source = validate_ip_network(source) if source is not None else None
         normalized_destination = validate_ip_network(destination) if destination is not None else None
         addresses = tuple(value for value in (normalized_source, normalized_destination) if value is not None)
-        if not addresses:
-            raise InvalidFirewallArgumentError("rich rule", "requires a source or destination network")
-        families = {":" in value for value in addresses}
-        if len(families) != 1:
-            raise InvalidFirewallArgumentError("rich rule", "source and destination must use the same address family")
-        family = "ipv6" if families.pop() else "ipv4"
-
-        clauses = [f'rule family="{family}"']
+        clauses = ["rule"]
+        if addresses:
+            families = {":" in value for value in addresses}
+            if len(families) != 1:
+                raise InvalidFirewallArgumentError(
+                    "rich rule", "source and destination must use the same address family"
+                )
+            family = "ipv6" if families.pop() else "ipv4"
+            clauses.append(f'family="{family}"')
         if normalized_source is not None:
             clauses.append(f'source address="{normalized_source}"')
         if normalized_destination is not None:

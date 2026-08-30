@@ -225,6 +225,67 @@ def test_rich_rule_writes_verify_the_exact_structured_rule(
     scripted_executor.assert_exhausted()
 
 
+@pytest.mark.parametrize(
+    (
+        "method_name",
+        "write_operation",
+        "list_operation",
+        "rule",
+        "kwargs",
+        "target",
+        "refreshed",
+    ),
+    [
+        (
+            "add_rich_rule",
+            "add_rich_rule_runtime",
+            "list_rich_rules_runtime",
+            'rule service name="ssh" accept',
+            {"service": "ssh", "port": None, "protocol": None, "action": "accept"},
+            ApplyTarget.RUNTIME,
+            'rule service name="ssh" accept\n',
+        ),
+        (
+            "remove_rich_rule",
+            "remove_rich_rule_permanent",
+            "list_rich_rules_permanent",
+            'rule port port="8443" protocol="tcp" drop',
+            {"service": None, "port": "8443", "protocol": "tcp", "action": "drop"},
+            ApplyTarget.PERMANENT,
+            "",
+        ),
+    ],
+)
+def test_addressless_rich_rule_writes_verify_parser_owned_structured_rules(
+    service: FirewalldService,
+    scripted_executor: ScriptedExecutor,
+    method_name: str,
+    write_operation: str,
+    list_operation: str,
+    rule: str,
+    kwargs: dict[str, str | None],
+    target: ApplyTarget,
+    refreshed: str,
+) -> None:
+    """Catches write verification rejecting canonical parser-recognized addressless rules."""
+    scripted_executor.respond(write_operation)
+    scripted_executor.respond(list_operation, stdout=refreshed)
+
+    method: Callable[..., object] = getattr(service, method_name)
+    result = method(
+        "public",
+        source=None,
+        destination=None,
+        target=target,
+        **kwargs,
+    )
+
+    assert result.is_success
+    assert _operations(scripted_executor) == [write_operation, list_operation]
+    assert scripted_executor.calls[0].spec.argv[-1].endswith(rule)
+    scripted_executor.assert_exhausted()
+
+
 def test_change_interface_zone_verifies_each_target_inventory(
     service: FirewalldService,
     scripted_executor: ScriptedExecutor,
