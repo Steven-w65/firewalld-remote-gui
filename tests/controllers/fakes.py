@@ -180,6 +180,8 @@ class FakeSSHManager:
     disconnect_thread: object | None = None
     connect_entered: Event | None = None
     connect_release: Event | None = None
+    disconnect_entered: Event | None = None
+    disconnect_release: Event | None = None
 
     def connect(self) -> None:
         from PySide6.QtCore import QThread
@@ -198,6 +200,10 @@ class FakeSSHManager:
 
         self.disconnect_calls += 1
         self.disconnect_thread = QThread.currentThread()
+        if self.disconnect_entered is not None:
+            self.disconnect_entered.set()
+        if self.disconnect_release is not None:
+            assert self.disconnect_release.wait(3)
 
 
 class ManagerFactory:
@@ -206,6 +212,8 @@ class ManagerFactory:
         self.next_errors: dict[str, Exception] = {}
         self.connect_entered: dict[str, Event] = {}
         self.connect_release: dict[str, Event] = {}
+        self.disconnect_entered: dict[str, Event] = {}
+        self.disconnect_release: dict[str, Event] = {}
 
     def __call__(
         self, server: ServerConfig, application: ApplicationConfig
@@ -216,6 +224,8 @@ class ManagerFactory:
             connect_error=self.next_errors.pop(server.id, None),
             connect_entered=self.connect_entered.get(server.id),
             connect_release=self.connect_release.get(server.id),
+            disconnect_entered=self.disconnect_entered.get(server.id),
+            disconnect_release=self.disconnect_release.get(server.id),
         )
         self.instances[server.id].append(manager)
         return manager

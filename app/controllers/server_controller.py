@@ -158,6 +158,40 @@ class _ConnectionAttempt:
             return self._manager
 
 
+class _ManagerCloseToken:
+    """Retain one detached manager until one worker closes it exactly once."""
+
+    def __init__(self, server_id: str, manager: _Manager) -> None:
+        self.server_id = server_id
+        self.manager_identity = id(manager)
+        self._manager: _Manager | None = manager
+        self._lock = Lock()
+        self._state = "open"
+
+    def close_once(self) -> bool:
+        with self._lock:
+            if self._state != "open":
+                return False
+            self._state = "closing"
+            manager = self._manager
+        try:
+            if manager is not None:
+                manager.disconnect()
+        finally:
+            with self._lock:
+                self._manager = None
+                self._state = "closed"
+        return True
+
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._state != "closed"
+
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._state == "closed"
+
+
 @dataclass(frozen=True, slots=True)
 class _ConnectedResources:
     manager: _Manager
@@ -204,6 +238,8 @@ class ServerController(QObject):
         self._selected_server_id = self._order[0] if self._order else None
         self._jobs: dict[tuple[str, int, str], _PublicJobRecord] = {}
         self._private_close_handles: set[JobHandle[Any]] = set()
+        self._close_token_lock = Lock()
+        self._close_tokens: dict[str, dict[int, _ManagerCloseToken]] = {}
 
     @property
     def selected_server_id(self) -> str | None:
@@ -271,7 +307,7 @@ class ServerController(QObject):
         return self._submit_connection(
             session,
             "connect",
-            managers_to_close=(),
+            tokens_to_close=(),
             attempt=attempt,
         )
 
@@ -281,18 +317,19 @@ class ServerController(QObject):
             raise RuntimeError(f"Cannot disconnect server '{server_id}' while disconnected.")
         attempt_manager = self._invalidate_attempt(session)
         manager = cast(_Manager | None, session._ssh_manager)
+        self._register_close_tokens(server_id, manager, attempt_manager)
         generation = self._advance_generation(session)
         self._scheduler.cancel_pending(server_id)
         self._detach(session, clear_snapshot=True)
         session.status = ConnectionStatus.DISCONNECTED
         session.busy_operation = "disconnect"
         self.session_changed.emit(server_id)
-        managers = self._unique_managers(manager, attempt_manager)
+        tokens = self._open_close_tokens(server_id)
         return self._submit(
             server_id,
             generation,
             "disconnect",
-            lambda: self._disconnect_managers(managers),
+            lambda: self._close_token_batch(tokens),
         )
 
     def reconnect(self, server_id: str) -> ControllerJobHandle:
@@ -305,6 +342,7 @@ class ServerController(QObject):
         )
         attempt_manager = self._invalidate_attempt(session)
         old_manager = cast(_Manager | None, session._ssh_manager)
+        self._register_close_tokens(server_id, old_manager, attempt_manager)
         self._advance_generation(session)
         self._scheduler.cancel_pending(server_id)
         self._detach(session, clear_snapshot=True)
@@ -316,7 +354,7 @@ class ServerController(QObject):
         return self._submit_connection(
             session,
             "reconnect",
-            managers_to_close=self._unique_managers(old_manager, attempt_manager),
+            tokens_to_close=self._open_close_tokens(server_id),
             attempt=attempt,
         )
 
@@ -354,17 +392,18 @@ class ServerController(QObject):
             old = old_sessions[server_id]
             attempt_manager = self._invalidate_attempt(old)
             manager = cast(_Manager | None, old._ssh_manager)
+            self._register_close_tokens(server_id, manager, attempt_manager)
             generation = self._advance_generation(old)
             self._scheduler.cancel_pending(server_id)
             self._detach(old, clear_snapshot=True)
-            managers = self._unique_managers(manager, attempt_manager)
-            if managers:
+            tokens = self._open_close_tokens(server_id)
+            if tokens:
                 operation = (
                     "close_replaced_session"
                     if server_id in diff.changed
                     else "close_removed_session"
                 )
-                self._submit_close(server_id, generation, operation, managers)
+                self._submit_close(server_id, generation, operation, tokens)
 
         reconciled: dict[str, ServerSession] = {}
         for config in loaded.servers:
@@ -405,29 +444,42 @@ class ServerController(QObject):
             session = self._sessions[server_id]
             attempt_manager = self._invalidate_attempt(session)
             manager = cast(_Manager | None, session._ssh_manager)
+            self._register_close_tokens(server_id, manager, attempt_manager)
             generation = self._advance_generation(session)
             self._scheduler.cancel_pending(server_id)
             self._detach(session, clear_snapshot=True)
             session.status = ConnectionStatus.DISCONNECTED
-            managers = self._unique_managers(manager, attempt_manager)
-            if managers:
+            tokens = self._open_close_tokens(server_id)
+            if tokens:
                 self._submit_close(
                     server_id,
                     generation,
                     "shutdown_disconnect",
-                    managers,
+                    tokens,
+                )
+        active_ids = set(self._order)
+        for server_id in sorted(self._close_token_server_ids() - active_ids):
+            self._scheduler.cancel_pending(server_id)
+            tokens = self._open_close_tokens(server_id)
+            if tokens:
+                self._submit_close(
+                    server_id,
+                    self._generations.get(server_id, 0),
+                    "shutdown_disconnect",
+                    tokens,
                 )
         self.sessions_changed.emit()
         drained = self._scheduler.wait_for_done(timeout_ms)
+        all_closed = not self._open_close_tokens()
         self._jobs.clear()
         self._private_close_handles.clear()
-        return drained
+        return drained and all_closed
 
     def _submit_connection(
         self,
         session: ServerSession,
         operation: str,
-        managers_to_close: tuple[_Manager, ...],
+        tokens_to_close: tuple[_ManagerCloseToken, ...],
         attempt: _ConnectionAttempt,
     ) -> ControllerJobHandle:
         server = session.config
@@ -435,7 +487,7 @@ class ServerController(QObject):
         sudo_password = session.sudo_password
 
         def work() -> _ConnectedResources:
-            self._disconnect_managers(managers_to_close)
+            self._close_token_batch(tokens_to_close)
             try:
                 if attempt.is_invalidated():
                     raise _ConnectionInvalidated()
@@ -497,13 +549,13 @@ class ServerController(QObject):
         server_id: str,
         generation: int,
         operation: str,
-        managers: tuple[_Manager, ...],
+        tokens: tuple[_ManagerCloseToken, ...],
     ) -> JobHandle[Any]:
         handle = self._scheduler.submit(
             server_id,
             generation,
             operation,
-            lambda: self._disconnect_managers(managers),
+            lambda: self._close_token_batch(tokens),
         )
         self._private_close_handles.add(handle)
         handle.finished.connect(
@@ -548,11 +600,12 @@ class ServerController(QObject):
                     else generation + 1
                 )
                 if manager is not None:
+                    self._register_close_tokens(server_id, manager)
                     self._submit_close(
                         server_id,
                         current_generation,
                         "discard_stale_connection",
-                        (manager,),
+                        self._open_close_tokens(server_id),
                     )
             return
         session = self._sessions[server_id]
@@ -675,6 +728,7 @@ class ServerController(QObject):
             session.snapshot = replace(session.snapshot, stale=True)
         if isinstance(error, SSHConnectionError) and session._ssh_manager is not None:
             manager = cast(_Manager, session._ssh_manager)
+            self._register_close_tokens(session.config.id, manager)
             session._ssh_manager = None
             session._service = None
             session.sudo_password = None
@@ -682,7 +736,7 @@ class ServerController(QObject):
                 session.config.id,
                 session.generation,
                 "close_failed_connection",
-                (manager,),
+                self._open_close_tokens(session.config.id),
             )
         session.latest_error = public_error.message
         self.error_raised.emit(session.config.id, public_error)
@@ -780,22 +834,69 @@ class ServerController(QObject):
         session._connection_attempt = None
         return None if attempt is None else attempt.invalidate()
 
-    @staticmethod
-    def _unique_managers(
-        *managers: _Manager | None,
-    ) -> tuple[_Manager, ...]:
-        unique: list[_Manager] = []
-        identities: set[int] = set()
-        for manager in managers:
-            if manager is not None and id(manager) not in identities:
-                identities.add(id(manager))
-                unique.append(manager)
-        return tuple(unique)
+    def _register_close_tokens(
+        self, server_id: str, *managers: _Manager | None
+    ) -> tuple[_ManagerCloseToken, ...]:
+        registered: list[_ManagerCloseToken] = []
+        with self._close_token_lock:
+            server_tokens = self._close_tokens.setdefault(server_id, {})
+            for manager in managers:
+                if manager is None:
+                    continue
+                identity = id(manager)
+                token = server_tokens.get(identity)
+                if token is None or token.is_closed():
+                    token = _ManagerCloseToken(server_id, manager)
+                    server_tokens[identity] = token
+                if token not in registered:
+                    registered.append(token)
+            if not server_tokens:
+                self._close_tokens.pop(server_id, None)
+        return tuple(registered)
 
-    @staticmethod
-    def _disconnect_managers(managers: tuple[_Manager, ...]) -> None:
-        for manager in managers:
-            manager.disconnect()
+    def _open_close_tokens(
+        self, server_id: str | None = None
+    ) -> tuple[_ManagerCloseToken, ...]:
+        with self._close_token_lock:
+            if server_id is not None:
+                tokens = tuple(self._close_tokens.get(server_id, {}).values())
+            else:
+                tokens = tuple(
+                    token
+                    for server_tokens in self._close_tokens.values()
+                    for token in server_tokens.values()
+                )
+        return tuple(token for token in tokens if token.is_open())
+
+    def _close_token_server_ids(self) -> set[str]:
+        with self._close_token_lock:
+            return set(self._close_tokens)
+
+    def _close_token_batch(
+        self, tokens: tuple[_ManagerCloseToken, ...]
+    ) -> None:
+        first_error: Exception | None = None
+        for token in tokens:
+            try:
+                token.close_once()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                if token.is_closed():
+                    self._release_close_token(token)
+        if first_error is not None:
+            raise first_error
+
+    def _release_close_token(self, token: _ManagerCloseToken) -> None:
+        with self._close_token_lock:
+            server_tokens = self._close_tokens.get(token.server_id)
+            if server_tokens is None:
+                return
+            if server_tokens.get(token.manager_identity) is token:
+                del server_tokens[token.manager_identity]
+            if not server_tokens:
+                del self._close_tokens[token.server_id]
 
     def _is_current(self, server_id: str, generation: int) -> bool:
         session = self._sessions.get(server_id)

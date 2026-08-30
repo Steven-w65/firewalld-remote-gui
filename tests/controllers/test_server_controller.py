@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 
 import pytest
@@ -52,6 +52,65 @@ def controller(dependencies, qapp):
 def _finish_connect(controller, scheduler, server_id: str) -> None:
     scheduler.pending(server_id, "connect").run()
     assert controller.session_view(server_id).status is ConnectionStatus.CONNECTED
+
+
+class _CancellationObservingScheduler(OperationScheduler):
+    def __init__(self) -> None:
+        super().__init__(max_threads=1)
+        self._observation_lock = Lock()
+        self.cancelled_ids: list[str] = []
+        self.submitted_operations: list[tuple[str, str]] = []
+        self.second_web_cancel = Event()
+
+    def submit(self, server_id, generation, operation, work):
+        with self._observation_lock:
+            self.submitted_operations.append((server_id, operation))
+        return super().submit(server_id, generation, operation, work)
+
+    def cancel_pending(self, server_id: str) -> None:
+        with self._observation_lock:
+            self.cancelled_ids.append(server_id)
+            if self.cancelled_ids.count("web01") >= 2:
+                self.second_web_cancel.set()
+        super().cancel_pending(server_id)
+
+
+def _connected_real_controller(qtbot):
+    from app.controllers.server_controller import ServerController
+
+    config_manager = FakeConfigManager(make_loaded("web01"))
+    scheduler = _CancellationObservingScheduler()
+    manager_factory = ManagerFactory()
+    service_factory = ServiceFactory()
+    controller = ServerController(
+        config_manager, scheduler, manager_factory, service_factory
+    )
+    controller.connect("web01")
+    qtbot.waitUntil(
+        lambda: controller.session_view("web01").status
+        is ConnectionStatus.CONNECTED,
+        timeout=3000,
+    )
+    assert scheduler.wait_for_done(3000)
+    return controller, config_manager, scheduler, manager_factory
+
+
+def _saturate_scheduler(scheduler):
+    entered = Event()
+    release = Event()
+
+    def block_pool() -> None:
+        entered.set()
+        assert release.wait(3)
+
+    scheduler.submit("pool-blocker", 0, "block_pool", block_pool)
+    assert entered.wait(1)
+    return release
+
+
+def _release_after_second_web_cancel(scheduler, release: Event) -> None:
+    if scheduler.second_web_cancel.wait(2):
+        release.set()
 
 
 def test_startup_preserves_configured_order_selects_first_and_does_not_connect(
@@ -795,3 +854,104 @@ def test_shutdown_closes_inflight_connection_without_qt_callback_delivery(
     assert view.snapshot is None
     assert not secrets_in(view)
     assert scheduler.wait_for_done(100)
+
+
+def test_shutdown_reclaims_queued_disconnect_and_closes_manager_once(qtbot: Any) -> None:
+    controller, _, scheduler, manager_factory = _connected_real_controller(qtbot)
+    manager = manager_factory.instances["web01"][0]
+    release_pool = _saturate_scheduler(scheduler)
+
+    public_handle = controller.disconnect("web01")
+    releaser = Thread(
+        target=_release_after_second_web_cancel,
+        args=(scheduler, release_pool),
+    )
+    releaser.start()
+
+    assert controller.shutdown(timeout_ms=3000)
+    releaser.join(2)
+    assert not releaser.is_alive()
+    disconnect_calls = manager.disconnect_calls
+    assert disconnect_calls == 1
+    assert manager.disconnect_thread is not controller.thread()
+    assert not hasattr(public_handle, "work")
+    assert not secrets_in(controller.sessions())
+    assert controller._open_close_tokens("web01") == ()
+
+
+def test_shutdown_reclaims_queued_reconnect_without_adopting_new_manager(
+    qtbot: Any,
+) -> None:
+    controller, _, scheduler, manager_factory = _connected_real_controller(qtbot)
+    old_manager = manager_factory.instances["web01"][0]
+    release_pool = _saturate_scheduler(scheduler)
+
+    public_handle = controller.reconnect("web01")
+    releaser = Thread(
+        target=_release_after_second_web_cancel,
+        args=(scheduler, release_pool),
+    )
+    releaser.start()
+
+    assert controller.shutdown(timeout_ms=3000)
+    releaser.join(2)
+    assert not releaser.is_alive()
+    disconnect_calls = old_manager.disconnect_calls
+    assert disconnect_calls == 1
+    assert old_manager.disconnect_thread is not controller.thread()
+    assert manager_factory.instances["web01"] == [old_manager]
+    assert controller.session_view("web01").status is ConnectionStatus.DISCONNECTED
+    assert not hasattr(public_handle, "work")
+    assert controller._open_close_tokens("web01") == ()
+
+
+def test_reload_resubmits_private_close_cancelled_by_later_reload(qtbot: Any) -> None:
+    controller, config_manager, scheduler, manager_factory = (
+        _connected_real_controller(qtbot)
+    )
+    manager = manager_factory.instances["web01"][0]
+    release_pool = _saturate_scheduler(scheduler)
+    config_manager.current = LoadedConfig(
+        config_manager.current.application,
+        (make_server("web01", host="replacement-one.example.test"),),
+    )
+    controller.reload_configuration()
+    config_manager.current = make_loaded()
+    controller.reload_configuration()
+    release_pool.set()
+
+    assert scheduler.wait_for_done(3000)
+    disconnect_calls = manager.disconnect_calls
+    assert disconnect_calls == 1
+    assert manager.disconnect_thread is not controller.thread()
+    assert controller._open_close_tokens("web01") == ()
+
+
+def test_shutdown_duplicate_cleanup_after_cancel_start_race_closes_once(
+    qtbot: Any,
+) -> None:
+    controller, _, scheduler, manager_factory = _connected_real_controller(qtbot)
+    manager = manager_factory.instances["web01"][0]
+    disconnect_entered = Event()
+    disconnect_release = Event()
+    manager.disconnect_entered = disconnect_entered
+    manager.disconnect_release = disconnect_release
+
+    controller.disconnect("web01")
+    assert disconnect_entered.wait(1)
+
+    def release_after_shutdown_resubmits() -> None:
+        assert scheduler.second_web_cancel.wait(2)
+        disconnect_release.set()
+
+    releaser = Thread(target=release_after_shutdown_resubmits)
+    releaser.start()
+    assert controller.shutdown(timeout_ms=3000)
+    releaser.join(2)
+    assert not releaser.is_alive()
+
+    disconnect_calls = manager.disconnect_calls
+    assert disconnect_calls == 1
+    assert manager.disconnect_thread is not controller.thread()
+    assert ("web01", "shutdown_disconnect") in scheduler.submitted_operations
+    assert controller._open_close_tokens("web01") == ()
