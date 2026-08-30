@@ -1,0 +1,1 @@
+"""GUI behavior tests."""
