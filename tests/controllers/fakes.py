@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
+from threading import Event
+from typing import Any
+
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QObject, QTimer, Signal
+
+from app.config.models import ApplicationConfig, LoadedConfig, ServerConfig
+from app.firewalld.service import ConnectionCheck, ConnectionTestResult, FirewalldInfo
+from app.models.firewall import FirewallSnapshot
+from app.utils.errors import ConfigurationError
+
+
+def make_server(
+    server_id: str,
+    *,
+    name: str | None = None,
+    host: str | None = None,
+    password: str | None = None,
+) -> ServerConfig:
+    return ServerConfig(
+        id=server_id,
+        name=name or server_id.upper(),
+        host=host or f"{server_id}.example.test",
+        username="operator",
+        password=password or f"ssh-{server_id}-secret",
+        sudo=True,
+    )
+
+
+def make_loaded(*server_ids: str) -> LoadedConfig:
+    return LoadedConfig(
+        application=ApplicationConfig(),
+        servers=tuple(make_server(server_id) for server_id in server_ids),
+    )
+
+
+def make_snapshot(
+    *, server_id: str = "web01", default_zone: str = "public", stale: bool = False
+) -> FirewallSnapshot:
+    return FirewallSnapshot(
+        hostname=server_id,
+        distribution="Test Linux",
+        firewalld_running=True,
+        firewalld_version="2.1.0",
+        default_zone=default_zone,
+        stale=stale,
+    )
+
+
+class FakeConfigManager:
+    def __init__(self, loaded: LoadedConfig) -> None:
+        self.current = loaded
+        self.next_load_error: ConfigurationError | None = None
+        self.load_calls = 0
+
+    def load(self) -> LoadedConfig:
+        self.load_calls += 1
+        error = self.next_load_error
+        self.next_load_error = None
+        if error is not None:
+            raise error
+        return self.current
+
+
+class ManualJobHandle(QObject):
+    started = Signal(str, int, str)
+    succeeded = Signal(str, int, str, object)
+    failed = Signal(str, int, str, object)
+    finished = Signal(str, int, str)
+
+    def __init__(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        work: Callable[[], object],
+    ) -> None:
+        super().__init__()
+        self.server_id = server_id
+        self.generation = generation
+        self.operation = operation
+        self.work = work
+
+    def emit_started(self) -> None:
+        self.started.emit(self.server_id, self.generation, self.operation)
+        self._deliver_queued_signals()
+
+    def emit_succeeded(self, value: object) -> None:
+        self.succeeded.emit(
+            self.server_id, self.generation, self.operation, value
+        )
+        self._deliver_queued_signals()
+
+    def emit_failed(self, error: Exception) -> None:
+        self.failed.emit(self.server_id, self.generation, self.operation, error)
+        self._deliver_queued_signals()
+
+    def emit_finished(self) -> None:
+        self.finished.emit(self.server_id, self.generation, self.operation)
+        self._deliver_queued_signals()
+
+    @staticmethod
+    def _deliver_queued_signals() -> None:
+        application = QCoreApplication.instance()
+        if application is not None:
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.MetaCall)
+            application.processEvents()
+            loop = QEventLoop()
+            QTimer.singleShot(0, loop.quit)
+            loop.exec()
+
+    def run(self) -> object:
+        self.emit_started()
+        try:
+            value = self.work()
+        except Exception as error:
+            self.emit_failed(error)
+            self.emit_finished()
+            return error
+        self.emit_succeeded(value)
+        self.emit_finished()
+        return value
+
+
+class ManualScheduler:
+    def __init__(self) -> None:
+        self.handles: list[ManualJobHandle] = []
+        self.cancelled: list[str] = []
+
+    def submit(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        work: Callable[[], object],
+    ) -> ManualJobHandle:
+        handle = ManualJobHandle(server_id, generation, operation, work)
+        self.handles.append(handle)
+        return handle
+
+    def cancel_pending(self, server_id: str) -> None:
+        self.cancelled.append(server_id)
+
+    def pending(
+        self, server_id: str, operation: str | None = None
+    ) -> ManualJobHandle:
+        matches = [
+            handle
+            for handle in self.handles
+            if handle.server_id == server_id
+            and (operation is None or handle.operation == operation)
+        ]
+        if not matches:
+            raise AssertionError(f"No pending job for {server_id!r} / {operation!r}")
+        return matches[-1]
+
+
+@dataclass
+class FakeSSHManager:
+    server_id: str
+    connect_error: Exception | None = None
+    connect_calls: int = 0
+    disconnect_calls: int = 0
+    connect_thread: object | None = None
+    disconnect_thread: object | None = None
+    connect_entered: Event | None = None
+
+    def connect(self) -> None:
+        from PySide6.QtCore import QThread
+
+        self.connect_calls += 1
+        self.connect_thread = QThread.currentThread()
+        if self.connect_entered is not None:
+            self.connect_entered.set()
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def disconnect(self) -> None:
+        from PySide6.QtCore import QThread
+
+        self.disconnect_calls += 1
+        self.disconnect_thread = QThread.currentThread()
+
+
+class ManagerFactory:
+    def __init__(self) -> None:
+        self.instances: dict[str, list[FakeSSHManager]] = defaultdict(list)
+        self.next_errors: dict[str, Exception] = {}
+        self.connect_entered: dict[str, Event] = {}
+
+    def __call__(
+        self, server: ServerConfig, application: ApplicationConfig
+    ) -> FakeSSHManager:
+        del application
+        manager = FakeSSHManager(
+            server_id=server.id,
+            connect_error=self.next_errors.pop(server.id, None),
+            connect_entered=self.connect_entered.get(server.id),
+        )
+        self.instances[server.id].append(manager)
+        return manager
+
+
+class FakeFirewalldService:
+    def __init__(self, manager: FakeSSHManager, server_id: str) -> None:
+        self.manager = manager
+        self.server_id = server_id
+        self.load_calls: list[str | None] = []
+        self.test_calls: list[str | None] = []
+        self.next_snapshot = make_snapshot(server_id=server_id)
+        self.next_load_error: Exception | None = None
+        self.next_test_error: Exception | None = None
+        self.load_threads: list[object] = []
+        self.test_threads: list[object] = []
+
+    def load_snapshot(
+        self, *, sudo_password: str | None = None
+    ) -> FirewallSnapshot:
+        from PySide6.QtCore import QThread
+
+        self.load_threads.append(QThread.currentThread())
+        self.load_calls.append(sudo_password)
+        if self.next_load_error is not None:
+            error = self.next_load_error
+            self.next_load_error = None
+            raise error
+        return self.next_snapshot
+
+    def connection_test(
+        self, *, sudo_password: str | None = None
+    ) -> ConnectionTestResult:
+        from PySide6.QtCore import QThread
+
+        self.test_threads.append(QThread.currentThread())
+        self.test_calls.append(sudo_password)
+        if self.next_test_error is not None:
+            error = self.next_test_error
+            self.next_test_error = None
+            raise error
+        return ConnectionTestResult(
+            hostname=self.server_id,
+            distribution="Test Linux",
+            effective_uid=1000,
+            firewalld=FirewalldInfo(True, True, "2.1.0"),
+            checks=(ConnectionCheck("hostname", True, "ok"),),
+        )
+
+
+class ServiceFactory:
+    def __init__(self) -> None:
+        self.instances: dict[str, list[FakeFirewalldService]] = defaultdict(list)
+        self.next_load_errors: dict[str, Exception] = {}
+        self.next_test_errors: dict[str, Exception] = {}
+
+    def __call__(
+        self, manager: FakeSSHManager, server_id: str
+    ) -> FakeFirewalldService:
+        service = FakeFirewalldService(manager, server_id)
+        service.next_load_error = self.next_load_errors.pop(server_id, None)
+        service.next_test_error = self.next_test_errors.pop(server_id, None)
+        self.instances[server_id].append(service)
+        return service
+
+
+def secrets_in(value: Any) -> bool:
+    return "secret" in repr(value)
