@@ -21,9 +21,19 @@ from app.controllers.server_controller import (
     SudoPasswordRequest,
 )
 from app.controllers.session import ServerSessionView
-from app.gui.dialogs import ErrorDialog, HostKeyDialog, SudoPasswordDialog
+from app.firewalld.lockout import LockoutRisk, RiskLevel
+from app.firewalld.service import ConnectionTestResult
+from app.gui.dialogs import (
+    ConfirmationDialog,
+    ErrorDialog,
+    HostKeyDialog,
+    SudoPasswordDialog,
+)
+from app.gui.overview_tab import OverviewTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
+from app.models.change import ChangePreview
+from app.models.enums import ApplyTarget, ConnectionStatus
 
 
 _TAB_NAMES = (
@@ -62,6 +72,7 @@ class MainWindow(QMainWindow):
         self.header_status.setAccessibleName("Selected server connection status")
         self.tabs = QTabWidget()
         self.tabs.setAccessibleName("Firewall management sections")
+        self.overview_tab = OverviewTab()
         self.state_panels: list[StatePanel] = []
 
         header = QHBoxLayout()
@@ -73,7 +84,8 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         content_layout.addLayout(header)
         content_layout.addWidget(self.tabs, 1)
-        for tab_name in _TAB_NAMES:
+        self.tabs.addTab(self.overview_tab, _TAB_NAMES[0])
+        for tab_name in _TAB_NAMES[1:]:
             panel = StatePanel(tab_name)
             self.state_panels.append(panel)
             self.tabs.addTab(panel, tab_name)
@@ -100,6 +112,16 @@ class MainWindow(QMainWindow):
         self.server_sidebar.disconnect_requested.connect(self._controller.disconnect)
         self.server_sidebar.reload_requested.connect(
             self._controller.reload_configuration
+        )
+        self.overview_tab.connect_requested.connect(self._connect_selected)
+        self.overview_tab.disconnect_requested.connect(self._disconnect_selected)
+        self.overview_tab.reconnect_requested.connect(self._reconnect_selected)
+        self.overview_tab.refresh_requested.connect(self._refresh_selected)
+        self.overview_tab.reload_firewalld_requested.connect(
+            self._reload_firewalld_selected
+        )
+        self.overview_tab.test_connection_requested.connect(
+            self._test_connection_selected
         )
         self.refresh_action.triggered.connect(self._refresh_selected)
         self.reload_configuration_action.triggered.connect(
@@ -147,6 +169,92 @@ class MainWindow(QMainWindow):
         if self.current_server_id is not None:
             self._controller.refresh(self.current_server_id)
 
+    @Slot()
+    def _connect_selected(self) -> None:
+        if self.current_server_id is not None:
+            self._controller.connect(self.current_server_id)
+
+    @Slot()
+    def _disconnect_selected(self) -> None:
+        if self.current_server_id is not None:
+            self._controller.disconnect(self.current_server_id)
+
+    @Slot()
+    def _reconnect_selected(self) -> None:
+        if self.current_server_id is not None:
+            self._controller.reconnect(self.current_server_id)
+
+    @Slot()
+    def _test_connection_selected(self) -> None:
+        view = self._selected_view()
+        if view is None:
+            return
+        handle = self._controller.test_connection(view.server_id)
+        handle.succeeded.connect(self._connection_test_succeeded)
+
+    @Slot(str, int, str, object)
+    def _connection_test_succeeded(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        result: object,
+    ) -> None:
+        if operation != "test_connection" or not isinstance(
+            result, ConnectionTestResult
+        ):
+            return
+        view = self._selected_view()
+        if (
+            view is None
+            or server_id != self.current_server_id
+            or view.server_id != server_id
+            or view.generation != generation
+        ):
+            return
+        self.overview_tab.show_connection_test(result)
+
+    @Slot()
+    def _reload_firewalld_selected(self) -> None:
+        view = self._selected_view()
+        if (
+            view is None
+            or view.status is not ConnectionStatus.CONNECTED
+            or view.busy_operation is not None
+        ):
+            return
+        preview = ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Reload firewalld",
+            zone="Global",
+            resource="firewalld daemon",
+            target=ApplyTarget.BOTH,
+            risk=LockoutRisk(
+                RiskLevel.NONE,
+                (
+                    "Reloading firewalld applies the global runtime and permanent "
+                    "configuration.",
+                ),
+            ),
+        )
+        server_id = view.server_id
+        generation = view.generation
+        dialog = ConfirmationDialog(preview, self)
+        dialog.exec()
+        if not dialog.confirmed():
+            return
+        current = self._selected_view()
+        if (
+            current is None
+            or current.server_id != server_id
+            or current.generation != generation
+            or current.status is not ConnectionStatus.CONNECTED
+            or current.busy_operation is not None
+        ):
+            return
+        self._controller.reload_firewalld(server_id)
+
     @Slot(str, object)
     def _host_key_required(self, server_id: str, challenge: object) -> None:
         try:
@@ -191,6 +299,7 @@ class MainWindow(QMainWindow):
 
     def _render_selected(self) -> None:
         view = self._selected_view()
+        self.overview_tab.set_session(view)
         for panel in self.state_panels:
             panel.set_session(view)
         if view is None:

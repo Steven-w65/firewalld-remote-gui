@@ -13,7 +13,8 @@ from app.config.config_manager import ConfigManager
 from app.config.models import ApplicationConfig, ConfigDiff, LoadedConfig, ServerConfig
 from app.controllers.session import ServerSession, ServerSessionView
 from app.firewalld.service import ConnectionTestResult, FirewalldService
-from app.models.enums import ConnectionStatus
+from app.models.command import CompositeOperationResult
+from app.models.enums import ApplyTarget, ConnectionStatus
 from app.models.firewall import FirewallSnapshot
 from app.utils.errors import (
     ChangedHostKeyError,
@@ -53,6 +54,13 @@ class _Service(Protocol):
     def connection_test(
         self, *, sudo_password: str | None = None
     ) -> ConnectionTestResult: ...
+
+    def reload_firewalld(
+        self,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
 
 
 class _HostKeyStore(Protocol):
@@ -499,6 +507,27 @@ class ServerController(QObject):
             lambda: service.connection_test(sudo_password=sudo_password),
         )
 
+    def reload_firewalld(self, server_id: str) -> ControllerJobHandle:
+        """Run one confirmed global reload, then publish one fresh snapshot."""
+        session = self._live_idle_session(server_id, "reload_firewalld")
+        service = cast(_Service, session._service)
+        sudo_password = session.sudo_password
+
+        def work() -> FirewallSnapshot:
+            result = service.reload_firewalld(
+                ApplyTarget.BOTH,
+                sudo_password=sudo_password,
+            )
+            if (
+                not isinstance(result, CompositeOperationResult)
+                or result.operation != "reload_firewalld"
+                or not result.is_success
+            ):
+                raise FirewallCommandError(server_id, "reload_firewalld")
+            return service.load_snapshot(sudo_password=sudo_password)
+
+        return self._start_service_job(session, "reload_firewalld", work)
+
     def reload_configuration(self) -> ConfigDiff | None:
         """Load then reconcile atomically; invalid input changes no session state."""
         try:
@@ -646,6 +675,13 @@ class ServerController(QObject):
             key = (request.server_id, request.generation, request.operation)
             self._sudo_retry_jobs.add(key)
             return self.test_connection(request.server_id)
+        if request.operation == "reload_firewalld":
+            if session._service is None:
+                return None
+            session.status = ConnectionStatus.CONNECTED
+            key = (request.server_id, request.generation, request.operation)
+            self._sudo_retry_jobs.add(key)
+            return self.reload_firewalld(request.server_id)
         return None
 
     def _clear_pending_decisions(self, server_id: str) -> None:
@@ -822,10 +858,12 @@ class ServerController(QObject):
             session.latest_error = None
             self.session_changed.emit(server_id)
             public_value = session.view()
-        elif operation == "refresh":
+        elif operation in {"refresh", "reload_firewalld"}:
             if not isinstance(value, FirewallSnapshot):
                 public_error = self._apply_failure(
-                    session, operation, TypeError("refresh returned invalid state")
+                    session,
+                    operation,
+                    TypeError(f"{operation} returned invalid state"),
                 )
                 record.public.failed.emit(
                     server_id, generation, operation, public_error
@@ -971,7 +1009,10 @@ class ServerController(QObject):
         if operation in {"connect", "reconnect"}:
             session._connection_attempt = None
 
-        if operation == "refresh" and session.snapshot is not None:
+        if (
+            operation in {"refresh", "reload_firewalld"}
+            and session.snapshot is not None
+        ):
             session.snapshot = replace(session.snapshot, stale=True)
         if isinstance(error, SSHConnectionError) and session._ssh_manager is not None:
             manager = cast(_Manager, session._ssh_manager)

@@ -10,6 +10,8 @@ from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QObject, QTimer
 
 from app.config.models import ApplicationConfig, LoadedConfig, ServerConfig
 from app.firewalld.service import ConnectionCheck, ConnectionTestResult, FirewalldInfo
+from app.models.command import CompositeOperationResult, TargetResult
+from app.models.enums import ApplyTarget, TargetStatus
 from app.models.firewall import FirewallSnapshot
 from app.utils.errors import ConfigurationError
 
@@ -240,8 +242,28 @@ class FakeFirewalldService:
         self.next_snapshot = make_snapshot(server_id=server_id)
         self.next_load_error: Exception | None = None
         self.next_test_error: Exception | None = None
+        self.next_reload_error: Exception | None = None
+        self.next_reload_result = CompositeOperationResult(
+            operation="reload_firewalld",
+            permanent=TargetResult(
+                ApplyTarget.PERMANENT,
+                TargetStatus.SUCCEEDED,
+                TargetStatus.SUCCEEDED,
+                None,
+                "",
+            ),
+            runtime=TargetResult(
+                ApplyTarget.RUNTIME,
+                TargetStatus.SUCCEEDED,
+                TargetStatus.SUCCEEDED,
+                None,
+                "",
+            ),
+        )
         self.load_threads: list[object] = []
         self.test_threads: list[object] = []
+        self.reload_calls: list[tuple[ApplyTarget, str | None]] = []
+        self.operation_trace: list[str] = []
 
     def load_snapshot(
         self, *, sudo_password: str | None = None
@@ -250,6 +272,7 @@ class FakeFirewalldService:
 
         self.load_threads.append(QThread.currentThread())
         self.load_calls.append(sudo_password)
+        self.operation_trace.append("load_snapshot")
         if self.next_load_error is not None:
             error = self.next_load_error
             self.next_load_error = None
@@ -263,6 +286,7 @@ class FakeFirewalldService:
 
         self.test_threads.append(QThread.currentThread())
         self.test_calls.append(sudo_password)
+        self.operation_trace.append("connection_test")
         if self.next_test_error is not None:
             error = self.next_test_error
             self.next_test_error = None
@@ -274,6 +298,20 @@ class FakeFirewalldService:
             firewalld=FirewalldInfo(True, True, "2.1.0"),
             checks=(ConnectionCheck("hostname", True, "ok"),),
         )
+
+    def reload_firewalld(
+        self,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.reload_calls.append((target, sudo_password))
+        self.operation_trace.append("reload_firewalld")
+        if self.next_reload_error is not None:
+            error = self.next_reload_error
+            self.next_reload_error = None
+            raise error
+        return self.next_reload_result
 
 
 class ServiceFactory:

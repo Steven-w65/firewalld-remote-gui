@@ -7,8 +7,13 @@ import pytest
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import QDialog
 
-from app.controllers.server_controller import ControllerOperationError, SudoPasswordRequest
+from app.controllers.server_controller import (
+    ControllerJobHandle,
+    ControllerOperationError,
+    SudoPasswordRequest,
+)
 from app.controllers.session import ServerSessionView
+from app.firewalld.service import ConnectionCheck, ConnectionTestResult, FirewalldInfo
 from app.gui.main_window import MainWindow
 from app.models.enums import ConnectionStatus
 from app.models.firewall import FirewallSnapshot
@@ -74,7 +79,11 @@ class FakeServerController(QObject):
         self.selected_server_id: str | None = "web01"
         self.connect_calls: list[str] = []
         self.disconnect_calls: list[str] = []
+        self.reconnect_calls: list[str] = []
         self.refresh_calls: list[str] = []
+        self.test_connection_calls: list[str] = []
+        self.reload_firewalld_calls: list[str] = []
+        self.operation_handles: list[ControllerJobHandle] = []
         self.reload_calls = 0
         self.shutdown_calls: list[int] = []
         self.host_key_decisions: list[tuple[str, int, object, bool]] = []
@@ -96,8 +105,20 @@ class FakeServerController(QObject):
     def disconnect(self, server_id: str) -> None:
         self.disconnect_calls.append(server_id)
 
+    def reconnect(self, server_id: str) -> ControllerJobHandle:
+        self.reconnect_calls.append(server_id)
+        return self._handle(server_id, "reconnect")
+
     def refresh(self, server_id: str) -> None:
         self.refresh_calls.append(server_id)
+
+    def test_connection(self, server_id: str) -> ControllerJobHandle:
+        self.test_connection_calls.append(server_id)
+        return self._handle(server_id, "test_connection")
+
+    def reload_firewalld(self, server_id: str) -> ControllerJobHandle:
+        self.reload_firewalld_calls.append(server_id)
+        return self._handle(server_id, "reload_firewalld")
 
     def reload_configuration(self) -> None:
         self.reload_calls += 1
@@ -123,6 +144,15 @@ class FakeServerController(QObject):
     def publish(self, replacement: ServerSessionView) -> None:
         self._views[replacement.server_id] = replacement
         self.session_changed.emit(replacement.server_id)
+
+    def _handle(self, server_id: str, operation: str) -> ControllerJobHandle:
+        handle = ControllerJobHandle(
+            server_id,
+            self._views[server_id].generation,
+            operation,
+        )
+        self.operation_handles.append(handle)
+        return handle
 
 
 @pytest.fixture
@@ -181,7 +211,9 @@ def test_shell_has_exact_tab_order_and_accessible_state_panels(window):
         "Rich Rules",
         "Logs",
     )
-    assert len(window.state_panels) == 7
+    assert window.tabs.widget(0) is window.overview_tab
+    assert window.overview_tab.accessibleName() == "Server overview"
+    assert len(window.state_panels) == 6
     assert all(panel.accessibleName() for panel in window.state_panels)
 
 
@@ -262,6 +294,158 @@ def test_menu_and_sidebar_actions_route_selected_id_to_public_controller(
     assert controller.connect_calls == ["web01"]
     assert controller.refresh_calls == ["db01"]
     assert controller.disconnect_calls == ["db01"]
+
+
+def test_overview_actions_route_the_exact_selected_server(window, controller):
+    window.server_sidebar.select_server("db01")
+
+    window.overview_tab.refresh_button.click()
+    window.overview_tab.test_connection_button.click()
+    window.overview_tab.reconnect_button.click()
+    window.overview_tab.disconnect_button.click()
+
+    assert controller.refresh_calls == ["db01"]
+    assert controller.test_connection_calls == ["db01"]
+    assert controller.reconnect_calls == ["db01"]
+    assert controller.disconnect_calls == ["db01"]
+
+
+def test_connection_test_result_renders_only_for_matching_selection_and_generation(
+    window, controller
+):
+    result = ConnectionTestResult(
+        hostname="db01",
+        distribution="Test Linux",
+        effective_uid=1000,
+        firewalld=FirewalldInfo(True, True, "2.1.0"),
+        checks=(ConnectionCheck("ssh_connection", True, "SSH succeeded."),),
+    )
+    window.server_sidebar.select_server("db01")
+    window.overview_tab.test_connection_button.click()
+    first = controller.operation_handles[-1]
+
+    window.server_sidebar.select_server("web01")
+    first.succeeded.emit("db01", first.generation, "test_connection", result)
+    assert window.overview_tab.test_results.rowCount() == 0
+
+    window.server_sidebar.select_server("db01")
+    window.overview_tab.test_connection_button.click()
+    second = controller.operation_handles[-1]
+    second.succeeded.emit("db01", second.generation + 1, "test_connection", result)
+    assert window.overview_tab.test_results.rowCount() == 0
+
+    second.succeeded.emit("db01", second.generation, "test_connection", result)
+    assert window.overview_tab.test_results.rowCount() == 1
+    assert window.overview_tab.test_results.item(0, 0).text() == "PASS"
+
+
+def test_connection_test_is_read_only_and_does_not_replace_snapshot(
+    window, controller
+):
+    window.server_sidebar.select_server("db01")
+    before = controller.session_view("db01").snapshot
+
+    window.overview_tab.test_connection_button.click()
+
+    assert controller.test_connection_calls == ["db01"]
+    assert controller.reload_firewalld_calls == []
+    assert controller.session_view("db01").snapshot is before
+
+
+def test_reload_confirmation_is_cancel_default_and_cancel_submits_nothing(
+    window, controller, monkeypatch
+):
+    previews: list[object] = []
+
+    class CancellingDialog:
+        def __init__(self, preview, parent):
+            previews.append(preview)
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+        def confirmed(self):
+            return False
+
+    monkeypatch.setattr("app.gui.main_window.ConfirmationDialog", CancellingDialog)
+    window.server_sidebar.select_server("db01")
+
+    window.overview_tab.reload_button.click()
+
+    assert len(previews) == 1
+    assert previews[0].operation == "Reload firewalld"
+    assert previews[0].target.value == "both"
+    assert not previews[0].risk.is_high
+    assert controller.reload_firewalld_calls == []
+
+
+def test_accepted_reload_revalidates_exact_server_and_generation_before_submit(
+    window, controller, monkeypatch
+):
+    class AcceptingDialog:
+        def __init__(self, preview, parent):
+            assert preview.server_name == "Database Server"
+            assert preview.host == "db01.example.test"
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr("app.gui.main_window.ConfirmationDialog", AcceptingDialog)
+    window.server_sidebar.select_server("db01")
+
+    window.overview_tab.reload_button.click()
+
+    assert controller.reload_firewalld_calls == ["db01"]
+
+
+def test_reload_acceptance_is_ignored_if_selection_changes_inside_dialog(
+    window, controller, monkeypatch
+):
+    class SwitchingDialog:
+        def __init__(self, preview, parent):
+            del preview, parent
+
+        def exec(self):
+            window.server_sidebar.select_server("web01")
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr("app.gui.main_window.ConfirmationDialog", SwitchingDialog)
+    window.server_sidebar.select_server("db01")
+
+    window.overview_tab.reload_button.click()
+
+    assert controller.reload_firewalld_calls == []
+
+
+def test_reload_acceptance_is_ignored_if_generation_changes_inside_dialog(
+    window, controller, monkeypatch
+):
+    class ReplacingDialog:
+        def __init__(self, preview, parent):
+            del preview, parent
+
+        def exec(self):
+            current = controller.session_view("db01")
+            controller.publish(replace(current, generation=current.generation + 1))
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr("app.gui.main_window.ConfirmationDialog", ReplacingDialog)
+    window.server_sidebar.select_server("db01")
+
+    window.overview_tab.reload_button.click()
+
+    assert controller.reload_firewalld_calls == []
 
 
 def test_status_bar_busy_message_tracks_selected_view_and_clears(

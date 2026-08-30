@@ -9,7 +9,8 @@ import pytest
 from PySide6.QtCore import QThread
 
 from app.config.models import LoadedConfig
-from app.models.enums import ConnectionStatus
+from app.models.command import CompositeOperationResult, TargetResult
+from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.utils.errors import (
     ChangedHostKeyError,
     ConfigurationError,
@@ -214,6 +215,7 @@ def test_public_handles_publish_only_safe_transformed_values(
     for operation, request in (
         ("refresh", lambda: controller.refresh("web01")),
         ("test_connection", lambda: controller.test_connection("web01")),
+        ("reload_firewalld", lambda: controller.reload_firewalld("web01")),
         ("reconnect", lambda: controller.reconnect("web01")),
         ("disconnect", lambda: controller.disconnect("web01")),
     ):
@@ -1504,3 +1506,128 @@ def test_sudo_refresh_retry_uses_same_generation_and_exact_logical_operation(
     retry.run()
     assert service.load_calls == [None, None, "sudo-web-secret"]
     assert controller.session_view("web01").status is ConnectionStatus.CONNECTED
+
+
+def test_reload_runs_one_global_write_then_one_refresh_and_publishes_updated_snapshot(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    service.operation_trace.clear()
+    service.next_snapshot = make_snapshot(server_id="web01", default_zone="internal")
+    observed: list[tuple[object, object]] = []
+
+    handle = controller.reload_firewalld("web01")
+    handle.succeeded.connect(
+        lambda _server_id, _generation, _operation, value: observed.append(
+            (value, controller.session_view("web01").snapshot)
+        )
+    )
+    scheduler.pending("web01", "reload_firewalld").run()
+
+    assert service.reload_calls == [(ApplyTarget.BOTH, None)]
+    assert service.operation_trace == ["reload_firewalld", "load_snapshot"]
+    assert observed == [(service.next_snapshot, service.next_snapshot)]
+    assert controller.session_view("web01").snapshot == service.next_snapshot
+
+
+def test_failed_reload_does_not_refresh_or_retry_and_marks_existing_snapshot_stale(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    service.operation_trace.clear()
+    service.next_reload_result = CompositeOperationResult(
+        operation="reload_firewalld",
+        permanent=TargetResult(
+            ApplyTarget.PERMANENT,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+            None,
+            "The firewalld change failed.",
+        ),
+        runtime=TargetResult(
+            ApplyTarget.RUNTIME,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+            None,
+            "The firewalld change failed.",
+        ),
+    )
+    failures: list[object] = []
+
+    handle = controller.reload_firewalld("web01")
+    handle.failed.connect(
+        lambda _server_id, _generation, _operation, error: failures.append(error)
+    )
+    scheduler.pending("web01", "reload_firewalld").run()
+
+    assert service.reload_calls == [(ApplyTarget.BOTH, None)]
+    assert service.operation_trace == ["reload_firewalld"]
+    assert len(failures) == 1
+    assert failures[0].operation == "reload_firewalld"
+    assert controller.session_view("web01").snapshot is not None
+    assert controller.session_view("web01").snapshot.stale
+
+
+def test_sudo_reload_retry_is_same_generation_exact_operation_and_happens_once(
+    controller, dependencies
+) -> None:
+    _, scheduler, _, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    service = service_factory.instances["web01"][0]
+    service.operation_trace.clear()
+    service.next_reload_error = SudoAuthenticationRequiredError(
+        "web01", "reload_firewalld"
+    )
+    requests: list[object] = []
+    controller.sudo_password_required.connect(
+        lambda _server_id, request: requests.append(request)
+    )
+
+    controller.reload_firewalld("web01")
+    scheduler.pending("web01", "reload_firewalld").run()
+    request = requests[0]
+    assert request.operation == "reload_firewalld"
+    assert controller.resolve_sudo_password(request, "sudo-web-secret")
+
+    retry = scheduler.pending("web01", "reload_firewalld")
+    assert retry.generation == request.generation
+    retry.run()
+
+    assert service.reload_calls == [
+        (ApplyTarget.BOTH, None),
+        (ApplyTarget.BOTH, "sudo-web-secret"),
+    ]
+    assert service.operation_trace == [
+        "reload_firewalld",
+        "reload_firewalld",
+        "load_snapshot",
+    ]
+    assert requests == [request]
+
+
+def test_reload_transport_failure_uses_existing_terminal_detach_and_close_path(
+    controller, dependencies
+) -> None:
+    _, scheduler, manager_factory, service_factory = dependencies
+    controller.connect("web01")
+    _finish_connect(controller, scheduler, "web01")
+    manager = manager_factory.instances["web01"][0]
+    service_factory.instances["web01"][0].next_reload_error = SSHConnectionError(
+        "web01", "connection lost"
+    )
+
+    controller.reload_firewalld("web01")
+    scheduler.pending("web01", "reload_firewalld").run()
+
+    view = controller.session_view("web01")
+    assert view.status is ConnectionStatus.CONNECTION_ERROR
+    assert view.snapshot is not None and view.snapshot.stale
+    scheduler.pending("web01", "close_failed_connection").run()
+    assert manager.disconnect_calls == 1
