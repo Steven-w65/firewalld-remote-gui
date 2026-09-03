@@ -167,9 +167,11 @@ class PortsTab(QWidget):
 
     def _presence_changed(self) -> None:
         self.table.clearSelection()
-        presence = self.view_combo.currentData()
-        if isinstance(presence, PortPresenceFilter):
-            self.proxy_model.set_presence_filter(presence)
+        try:
+            presence = PortPresenceFilter(self.view_combo.currentData())
+        except (TypeError, ValueError):
+            presence = PortPresenceFilter.ALL
+        self.proxy_model.set_presence_filter(presence)
         self._update_state()
 
     def _selection_changed(self) -> None:

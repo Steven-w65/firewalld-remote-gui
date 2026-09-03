@@ -253,6 +253,57 @@ def test_proxy_numeric_sort_and_row_mapping_preserve_exact_source_row(qtbot):
     assert proxy.port_row(QModelIndex()) is None
 
 
+def test_ports_tab_applies_every_plain_string_presence_choice_without_mutating_source(
+    qtbot,
+):
+    tab = PortsTab()
+    qtbot.addWidget(tab)
+    tab.set_session(_view())
+    source_before = tuple(
+        tab.source_model.row_at(row)
+        for row in range(tab.source_model.rowCount())
+    )
+
+    for index, expected in (
+        (1, ("22", "100")),
+        (2, ("22", "8000-8100")),
+        (3, ("22",)),
+        (0, ("22", "100", "8000-8100")),
+    ):
+        tab.table.selectRow(0)
+        assert tab.selected_row() is not None
+        assert tab.remove_button.isEnabled()
+
+        tab.view_combo.setCurrentIndex(index)
+
+        assert type(tab.view_combo.currentData()) is str
+        assert _visible_ports(tab.proxy_model) == expected
+        assert tab.selected_row() is None
+        assert not tab.remove_button.isEnabled()
+        assert tuple(
+            tab.source_model.row_at(row)
+            for row in range(tab.source_model.rowCount())
+        ) == source_before
+
+
+def test_ports_tab_invalid_presence_data_fails_safe_to_all_instead_of_staying_stale(
+    qtbot,
+):
+    tab = PortsTab()
+    qtbot.addWidget(tab)
+    tab.set_session(_view())
+    tab.view_combo.setCurrentIndex(1)
+    tab.proxy_model.set_presence_filter(PortPresenceFilter.RUNTIME)
+    assert _visible_ports(tab.proxy_model) == ("22", "100")
+    tab.table.selectRow(0)
+
+    tab.view_combo.setItemData(0, "")
+    tab.view_combo.setCurrentIndex(0)
+
+    assert _visible_ports(tab.proxy_model) == ("22", "100", "8000-8100")
+    assert tab.selected_row() is None
+
+
 def test_ports_tab_uses_snapshot_zone_union_and_emits_exact_intentions(qtbot):
     tab = PortsTab()
     qtbot.addWidget(tab)
