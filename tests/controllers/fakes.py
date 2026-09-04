@@ -129,6 +129,10 @@ class ManualJobHandle(QObject):
         self.emit_finished()
         return value
 
+    def run_synchronously_for_test(self) -> None:
+        """Run one queued fake job while preserving its public signal lifecycle."""
+        self.run()
+
 
 class ManualScheduler:
     def __init__(self) -> None:
@@ -243,6 +247,8 @@ class FakeFirewalldService:
         self.next_load_error: Exception | None = None
         self.next_test_error: Exception | None = None
         self.next_reload_error: Exception | None = None
+        self.next_add_port_error: Exception | None = None
+        self.next_remove_port_error: Exception | None = None
         self.next_reload_result = CompositeOperationResult(
             operation="reload_firewalld",
             permanent=TargetResult(
@@ -263,7 +269,17 @@ class FakeFirewalldService:
         self.load_threads: list[object] = []
         self.test_threads: list[object] = []
         self.reload_calls: list[tuple[ApplyTarget, str | None]] = []
+        self.add_port_calls: list[
+            tuple[str, str, str, ApplyTarget, str | None]
+        ] = []
+        self.remove_port_calls: list[
+            tuple[str, str, str, ApplyTarget, str | None]
+        ] = []
         self.operation_trace: list[str] = []
+        self.next_add_port_result = _successful_result("add_port")
+        self.next_remove_port_result = _successful_result("remove_port")
+        self.add_port_entered: Event | None = None
+        self.add_port_release: Event | None = None
 
     def load_snapshot(
         self, *, sudo_password: str | None = None
@@ -313,12 +329,51 @@ class FakeFirewalldService:
             raise error
         return self.next_reload_result
 
+    def add_port(
+        self,
+        zone: str,
+        port: str,
+        protocol: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.add_port_calls.append((zone, port, protocol, target, sudo_password))
+        self.operation_trace.append("add_port")
+        if self.add_port_entered is not None:
+            self.add_port_entered.set()
+        if self.add_port_release is not None:
+            assert self.add_port_release.wait(3)
+        if self.next_add_port_error is not None:
+            error = self.next_add_port_error
+            self.next_add_port_error = None
+            raise error
+        return self.next_add_port_result
+
+    def remove_port(
+        self,
+        zone: str,
+        port: str,
+        protocol: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.remove_port_calls.append((zone, port, protocol, target, sudo_password))
+        self.operation_trace.append("remove_port")
+        if self.next_remove_port_error is not None:
+            error = self.next_remove_port_error
+            self.next_remove_port_error = None
+            raise error
+        return self.next_remove_port_result
+
 
 class ServiceFactory:
     def __init__(self) -> None:
         self.instances: dict[str, list[FakeFirewalldService]] = defaultdict(list)
         self.next_load_errors: dict[str, Exception] = {}
         self.next_test_errors: dict[str, Exception] = {}
+        self.next_snapshots: dict[str, FirewallSnapshot] = {}
 
     def __call__(
         self, manager: FakeSSHManager, server_id: str
@@ -326,9 +381,32 @@ class ServiceFactory:
         service = FakeFirewalldService(manager, server_id)
         service.next_load_error = self.next_load_errors.pop(server_id, None)
         service.next_test_error = self.next_test_errors.pop(server_id, None)
+        service.next_snapshot = self.next_snapshots.pop(
+            server_id, service.next_snapshot
+        )
         self.instances[server_id].append(service)
         return service
 
 
 def secrets_in(value: Any) -> bool:
     return "secret" in repr(value)
+
+
+def _successful_result(operation: str) -> CompositeOperationResult:
+    return CompositeOperationResult(
+        operation=operation,
+        permanent=TargetResult(
+            ApplyTarget.PERMANENT,
+            TargetStatus.SUCCEEDED,
+            TargetStatus.SUCCEEDED,
+            None,
+            "",
+        ),
+        runtime=TargetResult(
+            ApplyTarget.RUNTIME,
+            TargetStatus.SUCCEEDED,
+            TargetStatus.SUCCEEDED,
+            None,
+            "",
+        ),
+    )

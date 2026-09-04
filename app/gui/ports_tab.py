@@ -23,7 +23,8 @@ from app.gui.models.ports_model import (
     merge_port_rows,
 )
 from app.gui.server_sidebar import status_presentation
-from app.models.enums import ConnectionStatus
+from app.models.command import CompositeOperationResult
+from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
 from app.models.port import PortRow
 from app.utils.validation import validate_inventory_token
@@ -81,6 +82,9 @@ class PortsTab(QWidget):
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setAccessibleName("Ports status")
+        self.result_label = QLabel()
+        self.result_label.setWordWrap(True)
+        self.result_label.setAccessibleName("Latest port operation result")
         self.refresh_button = QPushButton("Refresh")
         self.add_button = QPushButton("Add Port")
         self.remove_button = QPushButton("Remove Port")
@@ -93,6 +97,7 @@ class PortsTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(filters)
         layout.addWidget(self.table, 1)
+        layout.addWidget(self.result_label)
         layout.addLayout(actions)
 
         self.zone_combo.currentTextChanged.connect(self._zone_changed)
@@ -108,9 +113,17 @@ class PortsTab(QWidget):
 
     def set_session(self, view: ServerSessionView | None) -> None:
         previous_zone = self.zone_combo.currentText()
+        previous_generation = (
+            None if self._session is None else self._session.generation
+        )
         same_server = view is not None and view.server_id == self._server_id
+        same_session = (
+            same_server and view is not None and view.generation == previous_generation
+        )
         self._session = view
         self._server_id = None if view is None else view.server_id
+        if not same_session:
+            self.result_label.clear()
         snapshot = None if view is None else view.snapshot
         zones = self._snapshot_zones(snapshot)
 
@@ -129,6 +142,61 @@ class PortsTab(QWidget):
         self.zone_combo.blockSignals(False)
         self.table.clearSelection()
         self._load_selected_zone()
+
+    def available_zones(self) -> tuple[str, ...]:
+        return tuple(
+            self.zone_combo.itemText(index)
+            for index in range(self.zone_combo.count())
+        )
+
+    def contains(self, port: str, protocol: str) -> bool:
+        return any(
+            (row := self.source_model.row_at(index)) is not None
+            and row.port == port
+            and row.protocol == protocol
+            for index in range(self.source_model.rowCount())
+        )
+
+    def show_operation_result(self, result: CompositeOperationResult) -> None:
+        if not isinstance(result, CompositeOperationResult) or result.operation not in {
+            "add_port",
+            "remove_port",
+        }:
+            return
+        targets = tuple(
+            item for item in (result.permanent, result.runtime) if item is not None
+        )
+        verification_failed = any(
+            item.execution_status is TargetStatus.SUCCEEDED
+            and item.verification_status is TargetStatus.FAILED
+            for item in targets
+        )
+        if result.is_success:
+            text = "Port change completed and verified."
+        elif result.is_partial:
+            text = (
+                "Port change partially completed. Review the Runtime and Permanent "
+                "results before another change."
+            )
+        elif verification_failed:
+            text = (
+                "The port command completed, but verification did not confirm the "
+                "requested firewall state."
+            )
+        else:
+            text = "The port change did not complete. Firewall state was refreshed."
+        self.result_label.setText(text)
+        self.result_label.setAccessibleDescription(text)
+
+    @staticmethod
+    def target_for_row(row: PortRow) -> ApplyTarget:
+        if not isinstance(row, PortRow):
+            raise TypeError("row must be a PortRow")
+        if row.runtime and row.permanent:
+            return ApplyTarget.BOTH
+        if row.runtime:
+            return ApplyTarget.RUNTIME
+        return ApplyTarget.PERMANENT
 
     def selected_row(self) -> PortRow | None:
         selected = self.table.selectionModel().selectedRows()
@@ -177,7 +245,7 @@ class PortsTab(QWidget):
     def _selection_changed(self) -> None:
         self._update_actions()
 
-    def _connected_idle(self) -> bool:
+    def _can_refresh(self) -> bool:
         view = self._session
         return bool(
             view is not None
@@ -185,6 +253,14 @@ class PortsTab(QWidget):
             and view.busy_operation is None
             and view.snapshot is not None
             and self.zone_combo.currentText()
+        )
+
+    def _can_modify(self) -> bool:
+        return bool(
+            self._can_refresh()
+            and self._session is not None
+            and self._session.snapshot is not None
+            and not self._session.snapshot.stale
         )
 
     def _update_state(self) -> None:
@@ -221,18 +297,18 @@ class PortsTab(QWidget):
         self._update_actions()
 
     def _update_actions(self) -> None:
-        enabled = self._connected_idle()
-        self.refresh_button.setEnabled(enabled)
+        self.refresh_button.setEnabled(self._can_refresh())
+        enabled = self._can_modify()
         self.add_button.setEnabled(enabled)
         self.remove_button.setEnabled(enabled and self.selected_row() is not None)
 
     def _emit_refresh(self) -> None:
-        if self._connected_idle():
+        if self._can_refresh():
             self.refresh_requested.emit(self.zone_combo.currentText())
 
     def _emit_remove(self) -> None:
         row = self.selected_row()
-        if self._connected_idle() and row is not None:
+        if self._can_modify() and row is not None:
             self.remove_requested.emit(row)
 
 

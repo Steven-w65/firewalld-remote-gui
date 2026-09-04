@@ -535,6 +535,7 @@ class FirewalldService:
         *,
         result: CommandResult | None = None,
         verification: bool = False,
+        authentication_failed: bool = False,
     ) -> TargetResult:
         return TargetResult(
             target=target,
@@ -550,6 +551,7 @@ class FirewalldService:
                 if verification
                 else "The firewalld change failed."
             ),
+            authentication_failed=authentication_failed,
         )
 
     @staticmethod
@@ -562,6 +564,19 @@ class FirewalldService:
             verification_status=TargetStatus.SUCCEEDED,
             result=result,
             message="",
+        )
+
+    @staticmethod
+    def _target_not_run(target: ApplyTarget) -> TargetResult:
+        return TargetResult(
+            target=target,
+            execution_status=TargetStatus.NOT_RUN,
+            verification_status=TargetStatus.NOT_RUN,
+            result=None,
+            message=(
+                "This target was not run after authentication failed following "
+                "an earlier mutation."
+            ),
         )
 
     @staticmethod
@@ -583,19 +598,42 @@ class FirewalldService:
         sudo_password: str | None,
     ) -> CompositeOperationResult:
         results: dict[ApplyTarget, TargetResult] = {}
-        for selected in self._selected_targets(target):
+        selected_targets = self._selected_targets(target)
+        mutation_succeeded = False
+        for index, selected in enumerate(selected_targets):
             permanent = selected is ApplyTarget.PERMANENT
             spec = build(permanent)
             try:
                 command_result = self._execute(spec, sudo_password)
+            except (SudoAuthenticationError, SudoAuthenticationRequiredError):
+                if not mutation_succeeded:
+                    raise
+                results[selected] = self._target_failure(
+                    selected, authentication_failed=True
+                )
+                for remaining in selected_targets[index + 1 :]:
+                    results[remaining] = self._target_not_run(remaining)
+                break
             except _TERMINAL_FIREWALL_ERRORS:
                 raise
             except FirewallCommandError:
                 results[selected] = self._target_failure(selected)
                 continue
 
+            mutation_succeeded = True
+
             try:
                 verified = verify(permanent)
+            except (SudoAuthenticationError, SudoAuthenticationRequiredError):
+                results[selected] = self._target_failure(
+                    selected,
+                    result=command_result,
+                    verification=True,
+                    authentication_failed=True,
+                )
+                for remaining in selected_targets[index + 1 :]:
+                    results[remaining] = self._target_not_run(remaining)
+                break
             except _TERMINAL_FIREWALL_ERRORS:
                 raise
             except (FirewallCommandError, FirewallParseError):

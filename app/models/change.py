@@ -19,6 +19,8 @@ class ChangePreview:
     resource: str
     target: ApplyTarget
     risk: LockoutRisk
+    server_id: str | None = None
+    generation: int | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("server_name", "host", "operation", "zone", "resource"):
@@ -29,6 +31,16 @@ class ChangePreview:
             raise TypeError("target must be an ApplyTarget")
         if not isinstance(self.risk, LockoutRisk):
             raise TypeError("risk must be a LockoutRisk")
+        if (self.server_id is None) != (self.generation is None):
+            raise TypeError("server_id and generation must be provided together")
+        if self.server_id is not None and (
+            not isinstance(self.server_id, str) or not self.server_id
+        ):
+            raise TypeError("server_id must be a nonempty string")
+        if self.generation is not None and (
+            isinstance(self.generation, bool) or not isinstance(self.generation, int)
+        ):
+            raise TypeError("generation must be an integer")
 
 
 __all__ = ["ChangePreview"]

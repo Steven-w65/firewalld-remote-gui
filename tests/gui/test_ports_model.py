@@ -355,7 +355,7 @@ def test_ports_tab_uses_snapshot_zone_union_and_emits_exact_intentions(qtbot):
             _view(snapshot=_snapshot(stale=True)),
             "Stale firewall data",
             True,
-            True,
+            False,
         ),
     ),
 )

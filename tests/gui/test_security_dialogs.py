@@ -258,6 +258,26 @@ def test_changed_key_error_has_no_trust_or_replacement_action(qtbot):
     assert dialog.defaultButton() is dialog.close_button
 
 
+def test_port_post_mutation_refresh_error_uses_operation_specific_safe_copy(qtbot):
+    """Catches reuse of reload-specific wording for a completed port mutation."""
+    dialog = ErrorDialog.from_domain_error(
+        ControllerOperationError(
+            "web01",
+            "add_port",
+            "post_mutation_refresh",
+            "unsafe-secret raw refresh detail",
+        )
+    )
+    qtbot.addWidget(dialog)
+
+    visible = _widget_text(dialog).lower()
+    assert dialog.windowTitle() == "Port Change Completed; Refresh Failed"
+    assert "port change completed" in visible
+    assert "existing firewall data is stale" in visible
+    assert "reload" not in visible
+    assert "unsafe-secret" not in visible
+
+
 def test_dialogs_never_call_backend_objects(qtbot, challenge, risky_preview):
     for dialog in (
         HostKeyDialog(challenge),

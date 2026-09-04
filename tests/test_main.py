@@ -86,8 +86,9 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
             self.loaded = config_manager.load()
 
     class FakeWindow:
-        def __init__(self, controller):
+        def __init__(self, controller, firewall_controller):
             calls["window_controller"] = controller
+            calls["window_firewall_controller"] = firewall_controller
             calls["window"] = self
             self.show_calls = 0
             self.shutdown_calls = 0
@@ -118,11 +119,17 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
         main, "HostKeyStore", lambda path: calls.setdefault("known_hosts", path)
     )
     monkeypatch.setattr(main, "ServerController", FakeController)
+    monkeypatch.setattr(
+        main,
+        "FirewallController",
+        lambda controller: calls.setdefault("firewall_controller", controller),
+    )
     monkeypatch.setattr(main, "MainWindow", FakeWindow)
 
     exit_code = main.main(["remote-firewalld-manager"])
 
     controller = calls["window_controller"]
+    assert calls["window_firewall_controller"] is controller
     window = calls["window"]
     assert exit_code == 17
     assert calls["config_path"] == config_file

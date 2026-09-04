@@ -473,3 +473,58 @@ def test_sudo_signal_from_a_write_propagates_without_becoming_a_partial_result(
     assert caught.value is signal
     assert _operations(scripted_executor) == ["remove_service_runtime"]
     scripted_executor.assert_exhausted()
+
+
+def test_sudo_required_after_permanent_mutation_returns_phase_aware_result_without_runtime_write(
+    service: FirewalldService,
+    scripted_executor: ScriptedExecutor,
+) -> None:
+    """Catches a full-operation retry duplicating a mutation after verification auth."""
+    scripted_executor.respond("add_port_permanent")
+    scripted_executor.raise_error(
+        "list_ports_permanent",
+        SudoAuthenticationRequiredError("web01", "list_ports_permanent"),
+    )
+
+    result = service.add_port("public", "8080", "tcp", ApplyTarget.BOTH)
+
+    assert _operations(scripted_executor) == [
+        "add_port_permanent",
+        "list_ports_permanent",
+    ]
+    assert result.permanent is not None
+    assert result.permanent.execution_status is TargetStatus.SUCCEEDED
+    assert result.permanent.verification_status is TargetStatus.FAILED
+    assert result.permanent.authentication_failed
+    assert result.runtime is not None
+    assert result.runtime.execution_status is TargetStatus.NOT_RUN
+    assert result.runtime.verification_status is TargetStatus.NOT_RUN
+    scripted_executor.assert_exhausted()
+
+
+def test_sudo_required_on_later_target_preserves_verified_permanent_success_without_retry(
+    service: FirewalldService,
+    scripted_executor: ScriptedExecutor,
+) -> None:
+    """Catches loss of the first target result when later-target auth fails."""
+    scripted_executor.respond("remove_port_permanent")
+    scripted_executor.respond("list_ports_permanent", stdout="22/tcp\n")
+    scripted_executor.raise_error(
+        "remove_port_runtime",
+        SudoAuthenticationError("web01", "remove_port_runtime"),
+    )
+
+    result = service.remove_port("public", "8080", "tcp", ApplyTarget.BOTH)
+
+    assert _operations(scripted_executor) == [
+        "remove_port_permanent",
+        "list_ports_permanent",
+        "remove_port_runtime",
+    ]
+    assert result.permanent is not None and result.permanent.is_success
+    assert result.runtime is not None
+    assert result.runtime.execution_status is TargetStatus.FAILED
+    assert result.runtime.verification_status is TargetStatus.NOT_RUN
+    assert result.runtime.authentication_failed
+    assert result.is_partial
+    scripted_executor.assert_exhausted()

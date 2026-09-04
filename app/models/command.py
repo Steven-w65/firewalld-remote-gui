@@ -31,6 +31,7 @@ class TargetResult:
     verification_status: TargetStatus
     result: CommandResult | None
     message: str
+    authentication_failed: bool = False
 
     @property
     def is_success(self) -> bool:

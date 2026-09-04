@@ -36,6 +36,11 @@ from app.utils.errors import (
     SystemProbeError,
     UnknownHostKeyError,
 )
+from app.utils.validation import (
+    validate_inventory_token,
+    validate_port,
+    validate_protocol,
+)
 from app.workers.scheduler import JobHandle
 
 
@@ -60,6 +65,26 @@ class _Service(Protocol):
 
     def reload_firewalld(
         self,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
+    def add_port(
+        self,
+        zone: str,
+        port: str,
+        protocol: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
+    def remove_port(
+        self,
+        zone: str,
+        port: str,
+        protocol: str,
         target: ApplyTarget,
         *,
         sudo_password: str | None = None,
@@ -244,6 +269,37 @@ class _PendingTrustedRetry:
     port: int
 
 
+@dataclass(frozen=True, slots=True)
+class _PortChangeIntent:
+    server_id: str
+    generation: int
+    operation: str
+    zone: str
+    port: str
+    protocol: str
+    target: ApplyTarget
+
+
+@dataclass(frozen=True, slots=True)
+class _PortMutationOutcome:
+    result: CompositeOperationResult
+    snapshot: FirewallSnapshot | None
+    refresh_error: ControllerOperationError | None = None
+    terminal_transport: bool = False
+    clear_sudo: bool = False
+
+
+@dataclass(slots=True)
+class _LogicalPortJob:
+    intent: _PortChangeIntent
+    public: ControllerJobHandle
+    attempt: ControllerJobHandle | None = None
+    last_error: ControllerOperationError | None = None
+    started_emitted: bool = False
+    outcome_emitted: bool = False
+    completed: bool = False
+
+
 class ServerController(QObject):
     """Own isolated mutable sessions while publishing frozen state copies."""
 
@@ -288,6 +344,7 @@ class ServerController(QObject):
         ] = {}
         self._accepted_sudo_retries: set[SudoPasswordRequest] = set()
         self._sudo_retry_jobs: set[tuple[str, int, str]] = set()
+        self._port_jobs: dict[tuple[str, int, str], _LogicalPortJob] = {}
 
     @property
     def selected_server_id(self) -> str | None:
@@ -394,9 +451,11 @@ class ServerController(QObject):
             or session.status is ConnectionStatus.DISCONNECTED
         ):
             self._pending_sudo.pop(request.server_id, None)
+            self._cancel_port_job(request)
             return False
         if not isinstance(password, str) or not password:
             self._pending_sudo.pop(request.server_id, None)
+            self._cancel_port_job(request)
             return False
 
         session.sudo_password = password
@@ -539,6 +598,44 @@ class ServerController(QObject):
             return snapshot
 
         return self._start_service_job(session, "reload_firewalld", work)
+
+    def _schedule_port_change(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        zone: str,
+        port: str,
+        protocol: str,
+        target: ApplyTarget,
+    ) -> ControllerJobHandle:
+        """Schedule one validated port intent without exposing live resources."""
+        session = self._live_idle_session(server_id, operation)
+        if generation != session.generation:
+            raise RuntimeError("The server session changed before the port operation.")
+        if operation not in {"add_port", "remove_port"}:
+            raise ValueError("Unsupported port operation.")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        intent = _PortChangeIntent(
+            server_id=server_id,
+            generation=generation,
+            operation=operation,
+            zone=validate_inventory_token("zone", zone),
+            port=validate_port(port),
+            protocol=validate_protocol(protocol),
+            target=target,
+        )
+        key = (server_id, generation, operation)
+        if key in self._port_jobs:
+            raise RuntimeError("A matching port operation is already pending.")
+        logical = _LogicalPortJob(
+            intent=intent,
+            public=ControllerJobHandle(server_id, generation, operation),
+        )
+        self._port_jobs[key] = logical
+        self._launch_port_attempt(logical)
+        return logical.public
 
     def reload_configuration(self) -> ConfigDiff | None:
         """Load then reconcile atomically; invalid input changes no session state."""
@@ -694,9 +791,20 @@ class ServerController(QObject):
             key = (request.server_id, request.generation, request.operation)
             self._sudo_retry_jobs.add(key)
             return self.reload_firewalld(request.server_id)
+        if request.operation in {"add_port", "remove_port"}:
+            logical = self._port_jobs.get(
+                (request.server_id, request.generation, request.operation)
+            )
+            if logical is None or logical.completed or session._service is None:
+                return None
+            session.status = ConnectionStatus.CONNECTED
+            key = (request.server_id, request.generation, request.operation)
+            self._sudo_retry_jobs.add(key)
+            return self._launch_port_attempt(logical)
         return None
 
     def _clear_pending_decisions(self, server_id: str) -> None:
+        self._cancel_port_jobs(server_id)
         self._pending_host_keys.pop(server_id, None)
         self._pending_sudo.pop(server_id, None)
         self._clear_pending_trusted_retries(server_id)
@@ -715,6 +823,309 @@ class ServerController(QObject):
             for key, retry in self._pending_trusted_retries.items()
             if retry.server_id != server_id
         }
+
+    def _launch_port_attempt(
+        self, logical: _LogicalPortJob
+    ) -> ControllerJobHandle:
+        intent = logical.intent
+        session = self._live_idle_session(intent.server_id, intent.operation)
+        if session.generation != intent.generation:
+            raise RuntimeError("The server session changed before the port operation.")
+        service = cast(_Service, session._service)
+        sudo_password = session.sudo_password
+
+        def work() -> _PortMutationOutcome:
+            method = (
+                service.add_port
+                if intent.operation == "add_port"
+                else service.remove_port
+            )
+            result = method(
+                intent.zone,
+                intent.port,
+                intent.protocol,
+                intent.target,
+                sudo_password=sudo_password,
+            )
+            if (
+                not isinstance(result, CompositeOperationResult)
+                or result.operation != intent.operation
+            ):
+                raise FirewallCommandError(intent.server_id, intent.operation)
+            post_mutation_auth_failure = any(
+                target_result is not None
+                and target_result.authentication_failed
+                for target_result in (result.permanent, result.runtime)
+            )
+            try:
+                snapshot = service.load_snapshot(sudo_password=sudo_password)
+            except (SudoAuthenticationError, SudoAuthenticationRequiredError):
+                return _PortMutationOutcome(
+                    result=result,
+                    snapshot=None,
+                    refresh_error=ControllerOperationError(
+                        intent.server_id,
+                        intent.operation,
+                        "post_mutation_refresh",
+                        "The port change completed, but fresh firewall data could not be loaded.",
+                    ),
+                    clear_sudo=True,
+                )
+            except Exception as error:
+                return _PortMutationOutcome(
+                    result=result,
+                    snapshot=None,
+                    refresh_error=ControllerOperationError(
+                        intent.server_id,
+                        intent.operation,
+                        "post_mutation_refresh",
+                        "The port change completed, but fresh firewall data could not be loaded.",
+                    ),
+                    terminal_transport=isinstance(error, SSHConnectionError),
+                    clear_sudo=(
+                        post_mutation_auth_failure
+                        or isinstance(error, SSHAuthenticationError)
+                    ),
+                )
+            if not isinstance(snapshot, FirewallSnapshot):
+                return _PortMutationOutcome(
+                    result=result,
+                    snapshot=None,
+                    refresh_error=ControllerOperationError(
+                        intent.server_id,
+                        intent.operation,
+                        "post_mutation_refresh",
+                        "The port change completed, but fresh firewall data could not be loaded.",
+                    ),
+                    clear_sudo=post_mutation_auth_failure,
+                )
+            return _PortMutationOutcome(
+                result=result,
+                snapshot=snapshot,
+                clear_sudo=post_mutation_auth_failure,
+            )
+
+        attempt = self._start_service_job(session, intent.operation, work)
+        logical.attempt = attempt
+        attempt.started.connect(
+            lambda server_id, generation, operation, current=attempt: (
+                self._port_attempt_started(
+                    logical, current, server_id, generation, operation
+                )
+            )
+        )
+        attempt.succeeded.connect(
+            lambda server_id, generation, operation, value, current=attempt: (
+                self._port_attempt_succeeded(
+                    logical, current, server_id, generation, operation, value
+                )
+            )
+        )
+        attempt.failed.connect(
+            lambda server_id, generation, operation, error, current=attempt: (
+                self._port_attempt_failed(
+                    logical, current, server_id, generation, operation, error
+                )
+            )
+        )
+        attempt.finished.connect(
+            lambda server_id, generation, operation, current=attempt: (
+                self._port_attempt_finished(
+                    logical, current, server_id, generation, operation
+                )
+            )
+        )
+        return attempt
+
+    @staticmethod
+    def _matches_port_attempt(
+        logical: _LogicalPortJob,
+        attempt: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
+    ) -> bool:
+        intent = logical.intent
+        return (
+            not logical.completed
+            and logical.attempt is attempt
+            and intent.server_id == server_id
+            and intent.generation == generation
+            and intent.operation == operation
+        )
+
+    def _port_attempt_started(
+        self,
+        logical: _LogicalPortJob,
+        attempt: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
+    ) -> None:
+        if not self._matches_port_attempt(
+            logical, attempt, server_id, generation, operation
+        ):
+            return
+        if not logical.started_emitted:
+            logical.started_emitted = True
+            logical.public.started.emit(server_id, generation, operation)
+
+    def _port_attempt_succeeded(
+        self,
+        logical: _LogicalPortJob,
+        attempt: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
+        value: object,
+    ) -> None:
+        if not self._matches_port_attempt(
+            logical, attempt, server_id, generation, operation
+        ):
+            return
+        if not isinstance(value, CompositeOperationResult):
+            logical.last_error = ControllerOperationError(
+                server_id,
+                operation,
+                "operation",
+                "The remote operation failed.",
+            )
+            logical.public.failed.emit(
+                server_id, generation, operation, logical.last_error
+            )
+        else:
+            logical.public.succeeded.emit(server_id, generation, operation, value)
+        logical.outcome_emitted = True
+
+    def _port_attempt_failed(
+        self,
+        logical: _LogicalPortJob,
+        attempt: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
+        error: object,
+    ) -> None:
+        if not self._matches_port_attempt(
+            logical, attempt, server_id, generation, operation
+        ):
+            return
+        public_error = (
+            error
+            if isinstance(error, ControllerOperationError)
+            else ControllerOperationError(
+                server_id,
+                operation,
+                "operation",
+                "The remote operation failed.",
+            )
+        )
+        logical.last_error = public_error
+        pending = self._pending_sudo.get(server_id)
+        waiting = (
+            public_error.category == "sudo_required"
+            and (
+                (
+                    pending is not None
+                    and pending.request.generation == generation
+                    and pending.request.operation == operation
+                )
+                or any(
+                    request.server_id == server_id
+                    and request.generation == generation
+                    and request.operation == operation
+                    for request in self._accepted_sudo_retries
+                )
+            )
+        )
+        if waiting:
+            return
+        logical.public.failed.emit(server_id, generation, operation, public_error)
+        logical.outcome_emitted = True
+
+    def _port_attempt_finished(
+        self,
+        logical: _LogicalPortJob,
+        attempt: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
+    ) -> None:
+        if not self._matches_port_attempt(
+            logical, attempt, server_id, generation, operation
+        ):
+            return
+        if logical.outcome_emitted:
+            self._finish_port_job(logical)
+            return
+        pending = self._pending_sudo.get(server_id)
+        if (
+            pending is not None
+            and pending.request.generation == generation
+            and pending.request.operation == operation
+        ) or any(
+            request.server_id == server_id
+            and request.generation == generation
+            and request.operation == operation
+            for request in self._accepted_sudo_retries
+        ):
+            return
+        if logical.last_error is not None:
+            logical.public.failed.emit(
+                server_id, generation, operation, logical.last_error
+            )
+            logical.outcome_emitted = True
+            self._finish_port_job(logical)
+
+    def _finish_port_job(self, logical: _LogicalPortJob) -> None:
+        if logical.completed:
+            return
+        logical.completed = True
+        intent = logical.intent
+        key = (intent.server_id, intent.generation, intent.operation)
+        if self._port_jobs.get(key) is logical:
+            del self._port_jobs[key]
+        self._sudo_retry_jobs.discard(key)
+        logical.public.finished.emit(
+            intent.server_id, intent.generation, intent.operation
+        )
+
+    def _cancel_port_job(self, request: SudoPasswordRequest) -> None:
+        logical = self._port_jobs.get(
+            (request.server_id, request.generation, request.operation)
+        )
+        if logical is None or logical.completed:
+            return
+        error = logical.last_error or ControllerOperationError(
+            request.server_id,
+            request.operation,
+            "sudo_required",
+            "Sudo authentication is required.",
+        )
+        logical.public.failed.emit(
+            request.server_id, request.generation, request.operation, error
+        )
+        logical.outcome_emitted = True
+        self._finish_port_job(logical)
+
+    def _cancel_port_jobs(self, server_id: str) -> None:
+        for logical in tuple(self._port_jobs.values()):
+            if logical.intent.server_id != server_id or logical.completed:
+                continue
+            error = ControllerOperationError(
+                server_id,
+                logical.intent.operation,
+                "operation",
+                "The remote operation was cancelled because the server session changed.",
+            )
+            logical.public.failed.emit(
+                server_id,
+                logical.intent.generation,
+                logical.intent.operation,
+                error,
+            )
+            logical.outcome_emitted = True
+            self._finish_port_job(logical)
 
     def _submit_connection(
         self,
@@ -885,6 +1296,43 @@ class ServerController(QObject):
             session.latest_error = None
             self.session_changed.emit(server_id)
             public_value = value
+        elif operation in {"add_port", "remove_port"}:
+            if not isinstance(value, _PortMutationOutcome):
+                public_error = self._apply_failure(
+                    session,
+                    operation,
+                    TypeError("port operation returned invalid state"),
+                )
+                record.public.failed.emit(
+                    server_id, generation, operation, public_error
+                )
+                return
+            if value.snapshot is not None:
+                session.snapshot = value.snapshot
+            elif session.snapshot is not None:
+                session.snapshot = replace(session.snapshot, stale=True)
+            if value.clear_sudo:
+                session.sudo_password = None
+            if value.refresh_error is None:
+                session.latest_error = None
+            else:
+                session.latest_error = value.refresh_error.message
+                if value.terminal_transport and session._ssh_manager is not None:
+                    manager = cast(_Manager, session._ssh_manager)
+                    self._register_close_tokens(server_id, manager)
+                    session._ssh_manager = None
+                    session._service = None
+                    session.sudo_password = None
+                    session.status = ConnectionStatus.CONNECTION_ERROR
+                    self._submit_close(
+                        server_id,
+                        generation,
+                        "close_failed_connection",
+                        self._open_close_tokens(server_id),
+                    )
+                self.error_raised.emit(server_id, value.refresh_error)
+            self.session_changed.emit(server_id)
+            public_value = value.result
         elif operation == "test_connection":
             if not isinstance(value, ConnectionTestResult):
                 public_error = self._apply_failure(
@@ -1028,6 +1476,12 @@ class ServerController(QObject):
 
         if (
             operation in {"refresh", "reload_firewalld"}
+            and session.snapshot is not None
+        ):
+            session.snapshot = replace(session.snapshot, stale=True)
+        if (
+            operation in {"add_port", "remove_port"}
+            and isinstance(error, SSHConnectionError)
             and session.snapshot is not None
         ):
             session.snapshot = replace(session.snapshot, stale=True)

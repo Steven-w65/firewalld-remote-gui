@@ -20,20 +20,26 @@ from app.controllers.server_controller import (
     ServerController,
     SudoPasswordRequest,
 )
+from app.controllers.firewall_controller import FirewallController
 from app.controllers.session import ServerSessionView
 from app.firewalld.lockout import LockoutRisk, RiskLevel
 from app.firewalld.service import ConnectionTestResult
 from app.gui.dialogs import (
+    AddPortDialog,
     ConfirmationDialog,
     ErrorDialog,
     HostKeyDialog,
     SudoPasswordDialog,
 )
 from app.gui.overview_tab import OverviewTab
+from app.gui.ports_tab import PortsTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
 from app.models.change import ChangePreview
 from app.models.enums import ApplyTarget, ConnectionStatus
+from app.models.command import CompositeOperationResult
+from app.models.firewall import FirewallSnapshot
+from app.models.port import PortRow
 
 
 _TAB_NAMES = (
@@ -53,10 +59,14 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         controller: ServerController,
+        firewall_controller: FirewallController | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._controller = controller
+        self._firewall_controller = firewall_controller or FirewallController(
+            controller
+        )
         self._shutdown_complete = False
         self._shutdown_result = True
         self.current_server_id: str | None = controller.selected_server_id
@@ -73,6 +83,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setAccessibleName("Firewall management sections")
         self.overview_tab = OverviewTab()
+        self.ports_tab = PortsTab()
         self.state_panels: list[StatePanel] = []
 
         header = QHBoxLayout()
@@ -85,7 +96,8 @@ class MainWindow(QMainWindow):
         content_layout.addLayout(header)
         content_layout.addWidget(self.tabs, 1)
         self.tabs.addTab(self.overview_tab, _TAB_NAMES[0])
-        for tab_name in _TAB_NAMES[1:]:
+        self.tabs.addTab(self.ports_tab, _TAB_NAMES[1])
+        for tab_name in _TAB_NAMES[2:]:
             panel = StatePanel(tab_name)
             self.state_panels.append(panel)
             self.tabs.addTab(panel, tab_name)
@@ -123,6 +135,9 @@ class MainWindow(QMainWindow):
         self.overview_tab.test_connection_requested.connect(
             self._test_connection_selected
         )
+        self.ports_tab.refresh_requested.connect(self._ports_refresh_requested)
+        self.ports_tab.add_requested.connect(self._add_port_selected)
+        self.ports_tab.remove_requested.connect(self._remove_port_selected)
         self.refresh_action.triggered.connect(self._refresh_selected)
         self.reload_configuration_action.triggered.connect(
             self._controller.reload_configuration
@@ -135,6 +150,12 @@ class MainWindow(QMainWindow):
             self._sudo_password_required
         )
         self._controller.error_raised.connect(self._error_raised)
+        self._firewall_controller.snapshot_changed.connect(
+            self._firewall_snapshot_changed
+        )
+        self._firewall_controller.operation_result.connect(
+            self._firewall_operation_result
+        )
 
         self._sessions_changed()
 
@@ -255,6 +276,106 @@ class MainWindow(QMainWindow):
             return
         self._controller.reload_firewalld(server_id)
 
+    @Slot(str)
+    def _ports_refresh_requested(self, zone: str) -> None:
+        del zone
+        self._refresh_selected()
+
+    @Slot()
+    def _add_port_selected(self) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view):
+            return
+        assert view is not None and view.snapshot is not None
+        dialog = AddPortDialog(
+            self.ports_tab.available_zones(),
+            self.ports_tab.zone_combo.currentText(),
+            self,
+        )
+        dialog.exec()
+        request = dialog.request()
+        if request is None:
+            return
+        try:
+            preview = self._firewall_controller.preview_add_port(
+                view.server_id, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_port_intent_error(view.server_id, "add_port")
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_add_port(
+                view.server_id, preview, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
+    @Slot(object)
+    def _remove_port_selected(self, row: object) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view) or not isinstance(row, PortRow):
+            return
+        target = self.ports_tab.target_for_row(row)
+        try:
+            preview = self._firewall_controller.preview_remove_port(
+                view.server_id, row, target
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_port_intent_error(view.server_id, "remove_port")
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_remove_port(
+                view.server_id, preview, row, target
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
+    @Slot(str, object)
+    def _firewall_snapshot_changed(
+        self, server_id: str, snapshot: object
+    ) -> None:
+        if not isinstance(snapshot, FirewallSnapshot):
+            return
+        if server_id == self.current_server_id:
+            self._render_selected()
+
+    @Slot(str, object)
+    def _firewall_operation_result(self, server_id: str, result: object) -> None:
+        if (
+            server_id == self.current_server_id
+            and isinstance(result, CompositeOperationResult)
+        ):
+            self.ports_tab.show_operation_result(result)
+
+    @staticmethod
+    def _port_view_is_actionable(view: ServerSessionView | None) -> bool:
+        return bool(
+            view is not None
+            and view.status is ConnectionStatus.CONNECTED
+            and view.busy_operation is None
+            and view.snapshot is not None
+            and not view.snapshot.stale
+        )
+
+    def _show_port_intent_error(self, server_id: str, operation: str) -> None:
+        ErrorDialog.from_domain_error(
+            ControllerOperationError(
+                server_id,
+                operation,
+                "operation",
+                "The confirmed firewall state changed before submission.",
+            ),
+            self,
+        ).exec()
+
     @Slot(str, object)
     def _host_key_required(self, server_id: str, challenge: object) -> None:
         try:
@@ -300,6 +421,7 @@ class MainWindow(QMainWindow):
     def _render_selected(self) -> None:
         view = self._selected_view()
         self.overview_tab.set_session(view)
+        self.ports_tab.set_session(view)
         for panel in self.state_panels:
             panel.set_session(view)
         if view is None:

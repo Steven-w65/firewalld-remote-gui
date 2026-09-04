@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.config.config_manager import ConfigManager
 from app.config.models import ApplicationConfig, LoadedConfig, ServerConfig
+from app.controllers.firewall_controller import FirewallController
 from app.controllers.server_controller import ServerController
 from app.gui.main_window import MainWindow
 from app.paths import PortablePaths
@@ -79,7 +80,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         manager_factory,
         host_key_store=host_key_store,
     )
-    window = MainWindow(controller)
+    firewall_controller = FirewallController(controller)
+    window = MainWindow(controller, firewall_controller)
     window.show()
     try:
         return application.exec()

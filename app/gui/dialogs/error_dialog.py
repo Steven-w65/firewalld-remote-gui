@@ -128,6 +128,21 @@ _CATEGORY_PRESENTATIONS = {
     ),
 }
 
+_PORT_POST_MUTATION_PRESENTATIONS = {
+    "post_mutation_verification": _ErrorPresentation(
+        "Port Change Verification Incomplete",
+        "The port command completed, but the requested firewall state could not "
+        "be verified. Refresh or reconnect before making more changes.",
+        "warning",
+    ),
+    "post_mutation_refresh": _ErrorPresentation(
+        "Port Change Completed; Refresh Failed",
+        "The port change completed, but fresh firewall data could not be loaded. "
+        "Existing firewall data is stale.",
+        "warning",
+    ),
+}
+
 
 class ErrorDialog(QDialog):
     """Display only fixed copy selected by a typed, credential-free category."""
@@ -159,9 +174,17 @@ class ErrorDialog(QDialog):
         cls, error: object, parent: QWidget | None = None
     ) -> ErrorDialog:
         if isinstance(error, ControllerOperationError):
-            presentation = _CATEGORY_PRESENTATIONS.get(
-                error.category, _CATEGORY_PRESENTATIONS["operation"]
-            )
+            if error.operation in {"add_port", "remove_port"}:
+                presentation = _PORT_POST_MUTATION_PRESENTATIONS.get(
+                    error.category,
+                    _CATEGORY_PRESENTATIONS.get(
+                        error.category, _CATEGORY_PRESENTATIONS["operation"]
+                    ),
+                )
+            else:
+                presentation = _CATEGORY_PRESENTATIONS.get(
+                    error.category, _CATEGORY_PRESENTATIONS["operation"]
+                )
         elif isinstance(error, ChangedHostKeyError):
             presentation = _CATEGORY_PRESENTATIONS["host_key_changed"]
         elif isinstance(error, UnknownHostKeyError):
