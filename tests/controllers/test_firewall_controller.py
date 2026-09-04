@@ -420,3 +420,61 @@ def test_old_generation_completion_never_updates_new_session_or_finishes_facade(
     assert server.session_view("web01").status is ConnectionStatus.DISCONNECTED
     assert server.session_view("web01").snapshot is None
     assert len(service.add_port_calls) == 1
+
+
+def test_old_internal_handle_cannot_complete_later_same_operation_intent(
+    connected,
+) -> None:
+    """Catches callback matching that ignores the exact emitting attempt."""
+    firewall, _, scheduler, service, _ = connected
+    request = AddPortRequest("public", "8080", "tcp", ApplyTarget.RUNTIME)
+    preview = firewall.preview_add_port("web01", request)
+
+    firewall.apply_add_port("web01", preview, request)
+    key = ("web01", 0, "add_port")
+    old_internal = firewall._pending[key].internal
+    scheduler.pending("web01", "add_port").run_synchronously_for_test()
+
+    current_preview = firewall.preview_add_port("web01", request)
+    current_facade = firewall.apply_add_port("web01", current_preview, request)
+    actual_result = CompositeOperationResult(
+        "add_port",
+        runtime=_target(
+            ApplyTarget.RUNTIME,
+            TargetStatus.SUCCEEDED,
+            TargetStatus.SUCCEEDED,
+        ),
+    )
+    stale_result = CompositeOperationResult(
+        "add_port",
+        runtime=_target(
+            ApplyTarget.RUNTIME,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+        ),
+    )
+    service.next_add_port_result = actual_result
+    published: list[CompositeOperationResult] = []
+    succeeded: list[CompositeOperationResult] = []
+    finished: list[str] = []
+    firewall.operation_result.connect(lambda _sid, value: published.append(value))
+    current_facade.succeeded.connect(
+        lambda _sid, _generation, _operation, value: succeeded.append(value)
+    )
+    current_facade.finished.connect(
+        lambda _sid, _generation, operation: finished.append(operation)
+    )
+
+    old_internal.succeeded.emit("web01", 0, "add_port", stale_result)
+    old_internal.finished.emit("web01", 0, "add_port")
+
+    assert published == []
+    assert succeeded == []
+    assert finished == []
+
+    scheduler.pending("web01", "add_port").run_synchronously_for_test()
+
+    assert len(service.add_port_calls) == 2
+    assert published == [actual_result]
+    assert succeeded == [actual_result]
+    assert finished == ["add_port"]

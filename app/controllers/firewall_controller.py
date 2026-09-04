@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 from PySide6.QtCore import QObject, Signal
 
@@ -221,27 +222,32 @@ class FirewallController(QObject):
             server_id, generation, operation, facade, internal
         )
         self._pending[key] = pending
-        internal.started.connect(self._internal_started)
-        internal.succeeded.connect(self._internal_succeeded)
-        internal.failed.connect(self._internal_failed)
-        internal.finished.connect(self._internal_finished)
+        internal.started.connect(partial(self._internal_started, internal))
+        internal.succeeded.connect(partial(self._internal_succeeded, internal))
+        internal.failed.connect(partial(self._internal_failed, internal))
+        internal.finished.connect(partial(self._internal_finished, internal))
         return facade
 
     def _internal_started(
-        self, server_id: str, generation: int, operation: str
+        self,
+        internal: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
     ) -> None:
-        pending = self._matching(server_id, generation, operation)
+        pending = self._matching(internal, server_id, generation, operation)
         if pending is not None:
             pending.facade.started.emit(server_id, generation, operation)
 
     def _internal_succeeded(
         self,
+        internal: ControllerJobHandle,
         server_id: str,
         generation: int,
         operation: str,
         value: object,
     ) -> None:
-        pending = self._matching(server_id, generation, operation)
+        pending = self._matching(internal, server_id, generation, operation)
         if (
             pending is None
             or not isinstance(value, CompositeOperationResult)
@@ -264,12 +270,13 @@ class FirewallController(QObject):
 
     def _internal_failed(
         self,
+        internal: ControllerJobHandle,
         server_id: str,
         generation: int,
         operation: str,
         error: object,
     ) -> None:
-        pending = self._matching(server_id, generation, operation)
+        pending = self._matching(internal, server_id, generation, operation)
         if pending is None:
             return
         public_error = (
@@ -286,9 +293,13 @@ class FirewallController(QObject):
         pending.outcome_emitted = True
 
     def _internal_finished(
-        self, server_id: str, generation: int, operation: str
+        self,
+        internal: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
     ) -> None:
-        pending = self._matching(server_id, generation, operation)
+        pending = self._matching(internal, server_id, generation, operation)
         if pending is None:
             return
         key = (server_id, generation, operation)
@@ -311,10 +322,14 @@ class FirewallController(QObject):
         self.error_raised.emit(server_id, error)
 
     def _matching(
-        self, server_id: str, generation: int, operation: str
+        self,
+        internal: ControllerJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
     ) -> _PendingPortIntent | None:
         pending = self._pending.get((server_id, generation, operation))
-        if pending is None:
+        if pending is None or pending.internal is not internal:
             return None
         try:
             view = self.server_controller.session_view(server_id)
