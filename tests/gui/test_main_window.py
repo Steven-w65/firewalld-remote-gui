@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QDialog, QLabel
 from app.controllers.server_controller import (
     ControllerJobHandle,
     ControllerOperationError,
+    ServerController,
     SudoPasswordRequest,
 )
 from app.controllers.session import ServerSessionView
@@ -18,6 +19,14 @@ from app.gui.dialogs.confirmation_dialog import ConfirmationDialog
 from app.gui.main_window import MainWindow
 from app.models.enums import ConnectionStatus
 from app.models.firewall import FirewallSnapshot
+from app.utils.errors import FirewalldNotRunningError
+from tests.controllers.fakes import (
+    FakeConfigManager,
+    ManagerFactory,
+    ManualScheduler,
+    ServiceFactory,
+    make_loaded,
+)
 
 
 def snapshot(*, hostname: str, stale: bool = False) -> FirewallSnapshot:
@@ -295,6 +304,66 @@ def test_menu_and_sidebar_actions_route_selected_id_to_public_controller(
     assert controller.connect_calls == ["web01"]
     assert controller.refresh_calls == ["db01"]
     assert controller.disconnect_calls == ["db01"]
+
+
+def test_sidebar_connect_reconnects_live_firewalld_error_session(
+    qtbot, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.gui.main_window.ErrorDialog.exec",
+        lambda self: QDialog.DialogCode.Rejected,
+    )
+    scheduler = ManualScheduler()
+    manager_factory = ManagerFactory()
+    service_factory = ServiceFactory()
+    controller = ServerController(
+        FakeConfigManager(make_loaded("web01")),
+        scheduler,
+        manager_factory,
+        service_factory,
+    )
+    window = MainWindow(controller)
+    qtbot.addWidget(window)
+
+    controller.connect("web01")
+    scheduler.pending("web01", "connect").run()
+    service_factory.instances["web01"][0].next_load_error = (
+        FirewalldNotRunningError("web01", "get_state")
+    )
+    controller.refresh("web01")
+    scheduler.pending("web01", "refresh").run()
+
+    assert (
+        controller.session_view("web01").status
+        is ConnectionStatus.FIREWALLD_NOT_RUNNING
+    )
+    assert window.server_sidebar.connect_button.isEnabled()
+
+    window.server_sidebar.connect_button.click()
+
+    current = controller.session_view("web01")
+    assert current.status is ConnectionStatus.CONNECTING
+    assert current.busy_operation == "reconnect"
+    assert scheduler.pending("web01", "reconnect").operation == "reconnect"
+
+
+def test_sidebar_connect_uses_connect_for_disconnected_session(qtbot):
+    scheduler = ManualScheduler()
+    controller = ServerController(
+        FakeConfigManager(make_loaded("web01")),
+        scheduler,
+        ManagerFactory(),
+        ServiceFactory(),
+    )
+    window = MainWindow(controller)
+    qtbot.addWidget(window)
+
+    window.server_sidebar.connect_button.click()
+
+    current = controller.session_view("web01")
+    assert current.status is ConnectionStatus.CONNECTING
+    assert current.busy_operation == "connect"
+    assert scheduler.pending("web01", "connect").operation == "connect"
 
 
 def test_overview_actions_route_the_exact_selected_server(window, controller):

@@ -52,6 +52,17 @@ _TAB_NAMES = (
     "Logs",
 )
 
+_RECONNECTABLE_STATUSES = frozenset(
+    {
+        ConnectionStatus.AUTHENTICATION_FAILED,
+        ConnectionStatus.CONNECTION_ERROR,
+        ConnectionStatus.HOST_KEY_ERROR,
+        ConnectionStatus.PERMISSION_ERROR,
+        ConnectionStatus.FIREWALLD_NOT_INSTALLED,
+        ConnectionStatus.FIREWALLD_NOT_RUNNING,
+    }
+)
+
 
 class MainWindow(QMainWindow):
     """Render controller snapshots and forward user intentions by server ID."""
@@ -120,7 +131,7 @@ class MainWindow(QMainWindow):
         server_menu.addAction(self.reload_configuration_action)
 
         self.server_sidebar.server_selected.connect(self._controller.select)
-        self.server_sidebar.connect_requested.connect(self._controller.connect)
+        self.server_sidebar.connect_requested.connect(self._connect_server)
         self.server_sidebar.disconnect_requested.connect(self._controller.disconnect)
         self.server_sidebar.reload_requested.connect(
             self._controller.reload_configuration
@@ -194,6 +205,19 @@ class MainWindow(QMainWindow):
     def _connect_selected(self) -> None:
         if self.current_server_id is not None:
             self._controller.connect(self.current_server_id)
+
+    @Slot(str)
+    def _connect_server(self, server_id: str) -> None:
+        try:
+            view = self._controller.session_view(server_id)
+        except KeyError:
+            return
+        if view.busy_operation is not None:
+            return
+        if view.status is ConnectionStatus.DISCONNECTED:
+            self._controller.connect(server_id)
+        elif view.status in _RECONNECTABLE_STATUSES:
+            self._controller.reconnect(server_id)
 
     @Slot()
     def _disconnect_selected(self) -> None:
