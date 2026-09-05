@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from app.controllers.session import ServerSessionView
 from app.gui.server_sidebar import status_presentation
+from app.models.command import CompositeOperationResult, classify_composite_outcome
 from app.models.enums import ConnectionStatus
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ class OverviewTab(QWidget):
         super().__init__(parent)
         self.setAccessibleName("Server overview")
         self._identity: tuple[str, int] | None = None
+        self._reload_busy = False
 
         summary = QGroupBox("Server summary")
         summary_form = QFormLayout(summary)
@@ -73,6 +75,10 @@ class OverviewTab(QWidget):
         snapshot_status.addWidget(self.snapshot_status_icon)
         snapshot_status.addWidget(self.snapshot_status_label)
         snapshot_status.addStretch(1)
+
+        self.reload_result_label = QLabel()
+        self.reload_result_label.setWordWrap(True)
+        self.reload_result_label.setAccessibleName("Latest firewalld reload result")
 
         self.connect_button = QPushButton("Connect")
         self.disconnect_button = QPushButton("Disconnect")
@@ -114,6 +120,7 @@ class OverviewTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(summary)
         layout.addLayout(snapshot_status)
+        layout.addWidget(self.reload_result_label)
         layout.addLayout(actions)
         layout.addWidget(tests, 1)
         self.set_session(None)
@@ -131,6 +138,13 @@ class OverviewTab(QWidget):
         identity = None if view is None else (view.server_id, view.generation)
         if identity != self._identity:
             self._clear_connection_test()
+            self.reload_result_label.clear()
+        reload_busy = bool(
+            view is not None and view.busy_operation == "reload_firewalld"
+        )
+        if reload_busy and not self._reload_busy:
+            self.reload_result_label.clear()
+        self._reload_busy = reload_busy
         self._identity = identity
 
         if view is None:
@@ -218,6 +232,39 @@ class OverviewTab(QWidget):
             self.test_results.setItem(row, 0, result_item)
             self.test_results.setItem(row, 1, QTableWidgetItem(check.name))
             self.test_results.setItem(row, 2, QTableWidgetItem(check.message))
+
+    def show_reload_result(self, result: CompositeOperationResult) -> None:
+        """Render only fixed text derived from sanitized reload phase states."""
+        if (
+            not isinstance(result, CompositeOperationResult)
+            or result.operation != "reload_firewalld"
+        ):
+            return
+        outcome = classify_composite_outcome(result)
+        if outcome == "succeeded":
+            text = "Firewalld reload completed and verified."
+        elif outcome == "partial":
+            text = (
+                "Firewalld reload partially completed. Review the Runtime and "
+                "Permanent results before another change."
+            )
+        elif outcome == "verification_failed":
+            text = (
+                "Firewalld reloaded, but verification did not confirm the "
+                "requested firewall state."
+            )
+        elif outcome == "failed":
+            text = (
+                "Firewalld reload did not complete. Review the firewall data "
+                "before retrying."
+            )
+        else:
+            text = (
+                "Firewalld returned an inconsistent reload result. Refresh "
+                "firewall data before retrying."
+            )
+        self.reload_result_label.setText(text)
+        self.reload_result_label.setAccessibleDescription(text)
 
     def _render_no_selection(self) -> None:
         for label in (

@@ -14,7 +14,7 @@ from app.config.config_manager import ConfigManager
 from app.config.models import ApplicationConfig, ConfigDiff, LoadedConfig, ServerConfig
 from app.controllers.session import ServerSession, ServerSessionView
 from app.firewalld.service import ConnectionTestResult, FirewalldService
-from app.models.command import CompositeOperationResult
+from app.models.command import CompositeOperationResult, classify_composite_outcome
 from app.models.enums import ApplyTarget, ConnectionStatus
 from app.models.firewall import FirewallSnapshot
 from app.models.rich_rule import RichRuleRequest
@@ -1651,6 +1651,7 @@ class ServerController(QObject):
         if session.busy_operation != operation:
             return
         public_value: object = None
+        log_outcome = "succeeded"
         if operation in {"connect", "reconnect"}:
             if not isinstance(value, _ConnectedResources):
                 public_error = self._apply_failure(
@@ -1730,6 +1731,7 @@ class ServerController(QObject):
                 self.error_raised.emit(server_id, value.refresh_error)
             self.session_changed.emit(server_id)
             public_value = value.result
+            log_outcome = self._firewall_result_outcome(value.result)
         elif operation == "test_connection":
             if not isinstance(value, ConnectionTestResult):
                 public_error = self._apply_failure(
@@ -1744,7 +1746,7 @@ class ServerController(QObject):
             session.latest_error = None
             public_value = value
         self._append_job_log(
-            server_id, generation, operation, "succeeded", record.started_at
+            server_id, generation, operation, log_outcome, record.started_at
         )
         record.public.succeeded.emit(
             server_id, generation, operation, public_value
@@ -1828,6 +1830,11 @@ class ServerController(QObject):
                 f"duration={duration:.3f}s outcome={outcome}"
             ),
         )
+
+    @staticmethod
+    def _firewall_result_outcome(result: CompositeOperationResult) -> str:
+        """Classify immutable phase statuses into a fixed display-log value."""
+        return classify_composite_outcome(result)
 
     def _launch_trusted_retry(
         self, key: tuple[str, int, str]

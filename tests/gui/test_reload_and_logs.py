@@ -154,6 +154,256 @@ def test_reload_failed_result_is_sanitized_and_still_refreshes_once(
     assert service.operation_trace[-2:] == ["reload_firewalld", "load_snapshot"]
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    (
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+            ),
+            "Firewalld reload completed and verified.",
+            id="success",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+            ),
+            (
+                "Firewalld reload did not complete. Review the firewall data "
+                "before retrying."
+            ),
+            id="failed-mutation",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.FAILED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.FAILED,
+                ),
+            ),
+            (
+                "Firewalld reloaded, but verification did not confirm the "
+                "requested firewall state."
+            ),
+            id="verification-failed",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+            ),
+            (
+                "Firewalld reload partially completed. Review the Runtime and "
+                "Permanent results before another change."
+            ),
+            id="partial",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.FAILED,
+                    TargetStatus.SUCCEEDED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+            ),
+            (
+                "Firewalld returned an inconsistent reload result. Refresh "
+                "firewall data before retrying."
+            ),
+            id="inconsistent-phase-state",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+            ),
+            (
+                "Firewalld returned an inconsistent reload result. Refresh "
+                "firewall data before retrying."
+            ),
+            id="inconsistent-missing-global-target",
+        ),
+    ),
+)
+def test_overview_renders_each_safe_reload_composite(
+    reload_workflow, qtbot, result, expected
+) -> None:
+    server, firewall, _scheduler, _service = reload_workflow
+    window = MainWindow(server, firewall)
+    qtbot.addWidget(window)
+
+    window.overview_tab.show_reload_result(result)
+
+    assert window.overview_tab.reload_result_label.text() == expected
+    assert "secret" not in window.overview_tab.reload_result_label.text()
+
+
+def test_overview_reload_result_is_selected_server_generation_and_operation_isolated(
+    reload_workflow, qtbot, monkeypatch
+) -> None:
+    server, firewall, _scheduler, service = reload_workflow
+    window = MainWindow(server, firewall)
+    qtbot.addWidget(window)
+
+    class AcceptedConfirmation:
+        def __init__(self, _preview, parent=None):
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.gui.main_window.ConfirmationDialog", AcceptedConfirmation
+    )
+    window.overview_tab.reload_button.click()
+    facade = firewall._pending[("web01", 0, "reload_firewalld")].facade
+
+    facade.succeeded.emit(
+        "web01", 1, "reload_firewalld", service.next_reload_result
+    )
+    facade.succeeded.emit(
+        "db01", 0, "reload_firewalld", service.next_reload_result
+    )
+    facade.succeeded.emit("web01", 0, "add_port", service.next_reload_result)
+
+    assert window.overview_tab.reload_result_label.text() == ""
+    facade.succeeded.emit(
+        "web01", 0, "reload_firewalld", service.next_reload_result
+    )
+    expected = "Firewalld reload completed and verified."
+    assert window.overview_tab.reload_result_label.text() == expected
+    server.select("db01")
+    assert window.overview_tab.reload_result_label.text() == ""
+    facade.succeeded.emit(
+        "web01", 0, "reload_firewalld", service.next_reload_result
+    )
+    assert window.overview_tab.reload_result_label.text() == ""
+
+
+def test_reload_result_does_not_replace_stale_snapshot_warning(
+    reload_workflow, qtbot
+) -> None:
+    server, firewall, _scheduler, _service = reload_workflow
+    window = MainWindow(server, firewall)
+    qtbot.addWidget(window)
+    view = server.session_view("web01")
+    assert view.snapshot is not None
+    window.overview_tab.set_session(
+        replace(view, snapshot=replace(view.snapshot, stale=True))
+    )
+    failed = CompositeOperationResult(
+        "reload_firewalld",
+        permanent=_unsafe_target(
+            ApplyTarget.PERMANENT,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+        ),
+        runtime=_unsafe_target(
+            ApplyTarget.RUNTIME,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+        ),
+    )
+
+    window.overview_tab.show_reload_result(failed)
+
+    assert window.overview_tab.snapshot_status_label.text() == "Stale firewall data"
+    assert "did not complete" in window.overview_tab.reload_result_label.text()
+
+
+def test_completed_reload_handle_cannot_overwrite_overview_with_late_same_generation_result(
+    reload_workflow, qtbot, monkeypatch
+) -> None:
+    server, firewall, scheduler, service = reload_workflow
+    window = MainWindow(server, firewall)
+    qtbot.addWidget(window)
+
+    class AcceptedConfirmation:
+        def __init__(self, _preview, parent=None):
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.gui.main_window.ConfirmationDialog", AcceptedConfirmation
+    )
+    window.overview_tab.reload_button.click()
+    facade = firewall._pending[("web01", 0, "reload_firewalld")].facade
+    scheduler.pending("web01", "reload_firewalld").run_synchronously_for_test()
+    expected = "Firewalld reload completed and verified."
+    assert window.overview_tab.reload_result_label.text() == expected
+    assert server.session_view("web01").busy_operation is None
+
+    facade.succeeded.emit(
+        "web01",
+        0,
+        "reload_firewalld",
+        CompositeOperationResult(
+            "reload_firewalld",
+            runtime=_unsafe_target(
+                ApplyTarget.RUNTIME,
+                TargetStatus.FAILED,
+                TargetStatus.NOT_RUN,
+            ),
+        ),
+    )
+
+    assert window.overview_tab.reload_result_label.text() == expected
+
+
 def test_reload_refresh_failure_keeps_prior_snapshot_stale_and_safe_error(
     reload_workflow,
 ) -> None:
@@ -335,6 +585,126 @@ def test_controller_events_append_fixed_sanitized_operation_metadata(qapp) -> No
     assert server.log_entries("db01") == ()
 
 
+@pytest.mark.parametrize(
+    ("result", "expected_outcome"),
+    (
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+            ),
+            "failed",
+            id="failed",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+            ),
+            "partial",
+            id="partial",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.FAILED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.FAILED,
+                ),
+            ),
+            "verification_failed",
+            id="verification-failed",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+            ),
+            "succeeded",
+            id="succeeded",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                permanent=_unsafe_target(
+                    ApplyTarget.PERMANENT,
+                    TargetStatus.FAILED,
+                    TargetStatus.SUCCEEDED,
+                ),
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.FAILED,
+                    TargetStatus.NOT_RUN,
+                ),
+            ),
+            "inconsistent",
+            id="inconsistent",
+        ),
+        pytest.param(
+            CompositeOperationResult(
+                "reload_firewalld",
+                runtime=_unsafe_target(
+                    ApplyTarget.RUNTIME,
+                    TargetStatus.SUCCEEDED,
+                    TargetStatus.SUCCEEDED,
+                ),
+            ),
+            "inconsistent",
+            id="inconsistent-missing-global-target",
+        ),
+    ),
+)
+def test_reload_log_classifies_sanitized_composite_phases(
+    reload_workflow, result, expected_outcome
+) -> None:
+    server, _firewall, scheduler, service = reload_workflow
+    service.next_reload_result = result
+
+    server.reload_firewalld("web01")
+    scheduler.pending("web01", "reload_firewalld").run_synchronously_for_test()
+
+    reload_entries = tuple(
+        entry
+        for entry in server.log_entries("web01")
+        if "operation=reload_firewalld" in entry
+    )
+    assert reload_entries[-1].endswith(f"outcome={expected_outcome}")
+    assert "secret" not in reload_entries[-1]
+
+
 def test_controller_augments_injected_buffer_with_current_profile_passwords(
     qapp,
 ) -> None:
@@ -511,9 +881,12 @@ def test_overview_reload_uses_one_confirmation_and_one_controller_route(
     monkeypatch.setattr(
         "app.gui.main_window.ConfirmationDialog", AcceptedConfirmation
     )
+    window.overview_tab.show_reload_result(service.next_reload_result)
+    assert window.overview_tab.reload_result_label.text()
 
     window.overview_tab.reload_button.click()
 
+    assert window.overview_tab.reload_result_label.text() == ""
     assert len(confirmations) == 1
     assert "runtime-only changes may disappear" in " ".join(
         confirmations[0].risk.reasons
@@ -523,6 +896,10 @@ def test_overview_reload_uses_one_confirmation_and_one_controller_route(
     ) == 1
     scheduler.pending("web01", "reload_firewalld").run_synchronously_for_test()
     assert len(service.reload_calls) == 1
+    assert (
+        window.overview_tab.reload_result_label.text()
+        == "Firewalld reload completed and verified."
+    )
 
 
 def test_cancelled_overview_reload_never_schedules_mutation(

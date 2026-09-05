@@ -325,9 +325,32 @@ class MainWindow(QMainWindow):
         if not dialog.confirmed():
             return
         try:
-            self._firewall_controller.apply_reload(server_id, preview)
+            handle = self._firewall_controller.apply_reload(server_id, preview)
         except (KeyError, TypeError, RuntimeError, ValueError):
             return
+        handle.succeeded.connect(self._reload_operation_result)
+
+    @Slot(str, int, str, object)
+    def _reload_operation_result(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        result: object,
+    ) -> None:
+        view = self._selected_view()
+        if (
+            view is None
+            or server_id != self.current_server_id
+            or view.server_id != server_id
+            or view.generation != generation
+            or view.busy_operation != operation
+            or operation != "reload_firewalld"
+            or not isinstance(result, CompositeOperationResult)
+            or result.operation != operation
+        ):
+            return
+        self.overview_tab.show_reload_result(result)
 
     @Slot(str)
     def _clear_logs_view(self, server_id: str) -> None:
