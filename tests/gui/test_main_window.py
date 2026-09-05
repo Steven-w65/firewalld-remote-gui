@@ -225,8 +225,9 @@ def test_shell_has_exact_tab_order_and_accessible_state_panels(window):
     assert window.tabs.widget(2) is window.services_tab
     assert window.tabs.widget(3) is window.zones_tab
     assert window.tabs.widget(4) is window.interfaces_tab
+    assert window.tabs.widget(5) is window.rich_rules_tab
     assert window.overview_tab.accessibleName() == "Server overview"
-    assert len(window.state_panels) == 2
+    assert len(window.state_panels) == 1
     assert all(panel.accessibleName() for panel in window.state_panels)
 
 

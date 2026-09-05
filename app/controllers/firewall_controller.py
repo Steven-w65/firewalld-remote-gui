@@ -16,6 +16,7 @@ from app.controllers.session import ServerSessionView
 from app.firewalld.lockout import (
     LockoutRisk,
     RemovePortChange,
+    RemoveRichRuleChange,
     RemoveServiceChange,
     RiskLevel,
     assess_lockout_risk,
@@ -23,9 +24,15 @@ from app.firewalld.lockout import (
 from app.models.change import ChangePreview
 from app.models.command import CompositeOperationResult, TargetResult
 from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
-from app.models.firewall import FirewallSnapshot
+from app.models.firewall import FirewallSnapshot, RichRule
 from app.models.interface import ChangeInterfaceRequest
 from app.models.port import AddPortRequest, PortRow
+from app.models.rich_rule import (
+    RichRuleRequest,
+    RichRuleRow,
+    structured_rule_summary,
+    validate_structured_rule,
+)
 from app.models.service import AddServiceRequest, ServiceRow
 from app.utils.errors import InvalidFirewallArgumentError
 from app.utils.validation import validate_inventory_value
@@ -306,6 +313,73 @@ class FirewallController(QObject):
             generation=view.generation,
         )
 
+    def preview_add_rich_rule(
+        self, server_id: str, request: RichRuleRequest
+    ) -> ChangePreview:
+        if not isinstance(request, RichRuleRequest):
+            raise TypeError("request must be a RichRuleRequest")
+        view, snapshot = self._actionable_snapshot(server_id, "add a rich rule")
+        self._require_target_zones(snapshot, request.zone, request.target)
+        if request.service is not None:
+            validate_inventory_value(
+                "service", request.service, snapshot.available_services
+            )
+        rule = request.structured_rule()
+        if all(
+            self._has_rich_rule(snapshot, request.zone, rule, permanent)
+            for permanent in self._target_permanence(request.target)
+        ):
+            raise ValueError("The rich rule already exists in every requested target.")
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Add Structured Rich Rule",
+            zone=request.zone,
+            resource=structured_rule_summary(rule),
+            target=request.target,
+            risk=_INCOMPLETE_ADD_RISK,
+            server_id=view.server_id,
+            generation=view.generation,
+        )
+
+    def preview_remove_rich_rule(
+        self,
+        server_id: str,
+        row: RichRuleRow,
+        target: ApplyTarget,
+    ) -> ChangePreview:
+        if not isinstance(row, RichRuleRow):
+            raise TypeError("row must be a RichRuleRow")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        view, snapshot = self._actionable_snapshot(server_id, "remove a rich rule")
+        self._require_target_zones(snapshot, row.zone, target)
+        if not row.supported:
+            raise ValueError("Unsupported raw rich rules are display-only.")
+        runtime = self._has_rich_rule(snapshot, row.zone, row.rule, False)
+        permanent = self._has_rich_rule(snapshot, row.zone, row.rule, True)
+        if row.runtime != runtime or row.permanent != permanent:
+            raise ValueError("The selected rich-rule row changed in the current snapshot.")
+        for target_permanent in self._target_permanence(target):
+            if not (permanent if target_permanent else runtime):
+                raise ValueError("The rich rule is absent from a requested remove target.")
+        risk = assess_lockout_risk(
+            RemoveRichRuleChange(row.zone, row.rule),
+            snapshot,
+            ssh_port=view.port,
+        )
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Remove Structured Rich Rule",
+            zone=row.zone,
+            resource=structured_rule_summary(row.rule),
+            target=target,
+            risk=risk,
+            server_id=view.server_id,
+            generation=view.generation,
+        )
+
     def apply_add_port(
         self,
         server_id: str,
@@ -495,6 +569,69 @@ class FirewallController(QObject):
             server_id, generation, "change_interface_zone", internal
         )
 
+    def apply_add_rich_rule(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+        request: RichRuleRequest,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        if not isinstance(request, RichRuleRequest):
+            raise TypeError("request must be a RichRuleRequest")
+        self._require_selected(server_id)
+        try:
+            current = self.preview_add_rich_rule(server_id, request)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The server or firewall inventory changed after confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        view = self.server_controller.session_view(server_id)
+        if view.snapshot is None:
+            raise RuntimeError("The firewall inventory changed after confirmation.")
+        effective_target = self._missing_rich_rule_target(
+            view.snapshot, request.zone, request.structured_rule(), request.target
+        )
+        return self._schedule_rich_rule(
+            server_id,
+            current.generation,
+            "add_rich_rule",
+            request.zone,
+            request.structured_rule(),
+            effective_target,
+        )
+
+    def apply_remove_rich_rule(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+        row: RichRuleRow,
+        target: ApplyTarget,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        if not isinstance(row, RichRuleRow):
+            raise TypeError("row must be a RichRuleRow")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        self._require_selected(server_id)
+        try:
+            current = self.preview_remove_rich_rule(server_id, row, target)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The selected rich rule or firewall inventory changed after confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        return self._schedule_rich_rule(
+            server_id,
+            current.generation,
+            "remove_rich_rule",
+            row.zone,
+            row.rule,
+            target,
+        )
+
     def _schedule(
         self,
         server_id: str,
@@ -541,6 +678,35 @@ class FirewallController(QObject):
             operation,
             zone,
             service,
+            target,
+        )
+        return self._bind_internal(server_id, generation, operation, internal)
+
+    def _schedule_rich_rule(
+        self,
+        server_id: str,
+        generation: int | None,
+        operation: str,
+        zone: str,
+        rule: RichRule,
+        target: ApplyTarget,
+    ) -> FirewallJobHandle:
+        if generation is None:
+            raise RuntimeError("The confirmed preview has no session generation.")
+        identity = validate_structured_rule(rule)
+        if identity is None:
+            raise ValueError("Unsupported raw rich rules are display-only.")
+        internal = self.server_controller._schedule_rich_rule_change(
+            server_id,
+            generation,
+            operation,
+            zone,
+            rule.source,
+            rule.destination,
+            rule.service,
+            rule.port,
+            rule.protocol,
+            rule.action,
             target,
         )
         return self._bind_internal(server_id, generation, operation, internal)
@@ -746,6 +912,43 @@ class FirewallController(QObject):
         if missing == (False,):
             return ApplyTarget.RUNTIME
         raise RuntimeError("The service is already present in every requested target.")
+
+    @staticmethod
+    def _has_rich_rule(
+        snapshot: FirewallSnapshot,
+        zone: str,
+        rule: RichRule,
+        permanent: bool,
+    ) -> bool:
+        expected = validate_structured_rule(rule)
+        if expected is None:
+            return False
+        state = snapshot.zone(zone, permanent)
+        return bool(
+            state is not None
+            and any(validate_structured_rule(item) == expected for item in state.rich_rules)
+        )
+
+    @classmethod
+    def _missing_rich_rule_target(
+        cls,
+        snapshot: FirewallSnapshot,
+        zone: str,
+        rule: RichRule,
+        target: ApplyTarget,
+    ) -> ApplyTarget:
+        missing = tuple(
+            permanent
+            for permanent in cls._target_permanence(target)
+            if not cls._has_rich_rule(snapshot, zone, rule, permanent)
+        )
+        if missing == (True, False):
+            return ApplyTarget.BOTH
+        if missing == (True,):
+            return ApplyTarget.PERMANENT
+        if missing == (False,):
+            return ApplyTarget.RUNTIME
+        raise RuntimeError("The rich rule is already present in every requested target.")
 
     @staticmethod
     def _require_exact_preview(

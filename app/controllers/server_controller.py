@@ -16,6 +16,7 @@ from app.firewalld.service import ConnectionTestResult, FirewalldService
 from app.models.command import CompositeOperationResult
 from app.models.enums import ApplyTarget, ConnectionStatus
 from app.models.firewall import FirewallSnapshot
+from app.models.rich_rule import RichRuleRequest
 from app.utils.errors import (
     ChangedHostKeyError,
     ConfigurationError,
@@ -120,6 +121,34 @@ class _Service(Protocol):
         self,
         interface: str,
         zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
+    def add_rich_rule(
+        self,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
+    def remove_rich_rule(
+        self,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
         target: ApplyTarget,
         *,
         sudo_password: str | None = None,
@@ -344,11 +373,20 @@ class _InterfaceChangeIntent:
     target: ApplyTarget
 
 
+@dataclass(frozen=True, slots=True)
+class _RichRuleChangeIntent:
+    server_id: str
+    generation: int
+    operation: str
+    request: RichRuleRequest
+
+
 _FirewallChangeIntent = (
     _PortChangeIntent
     | _ServiceChangeIntent
     | _DefaultZoneChangeIntent
     | _InterfaceChangeIntent
+    | _RichRuleChangeIntent
 )
 
 
@@ -816,6 +854,50 @@ class ServerController(QObject):
         self._launch_firewall_attempt(logical)
         return logical.public
 
+    def _schedule_rich_rule_change(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
+        target: ApplyTarget,
+    ) -> ControllerJobHandle:
+        """Schedule one validated structured rule without retaining raw text."""
+        session = self._live_idle_session(server_id, operation)
+        if generation != session.generation:
+            raise RuntimeError(
+                "The server session changed before the rich-rule operation."
+            )
+        if operation not in {"add_rich_rule", "remove_rich_rule"}:
+            raise ValueError("Unsupported rich-rule operation.")
+        request = RichRuleRequest(
+            zone,
+            source,
+            destination,
+            service,
+            port,
+            protocol,
+            action,
+            target,
+        )
+        key = (server_id, generation, operation)
+        if key in self._firewall_jobs:
+            raise RuntimeError("A matching rich-rule operation is already pending.")
+        intent = _RichRuleChangeIntent(server_id, generation, operation, request)
+        logical = _LogicalFirewallJob(
+            intent=intent,
+            public=ControllerJobHandle(server_id, generation, operation),
+        )
+        self._firewall_jobs[key] = logical
+        self._launch_firewall_attempt(logical)
+        return logical.public
+
     def reload_configuration(self) -> ConfigDiff | None:
         """Load then reconcile atomically; invalid input changes no session state."""
         try:
@@ -977,6 +1059,8 @@ class ServerController(QObject):
             "remove_service",
             "set_default_zone",
             "change_interface_zone",
+            "add_rich_rule",
+            "remove_rich_rule",
         }:
             logical = self._firewall_jobs.get(
                 (request.server_id, request.generation, request.operation)
@@ -1053,6 +1137,24 @@ class ServerController(QObject):
                     intent.interface,
                     intent.zone,
                     intent.target,
+                    sudo_password=sudo_password,
+                )
+            elif isinstance(intent, _RichRuleChangeIntent):
+                request = intent.request
+                method = (
+                    service.add_rich_rule
+                    if intent.operation == "add_rich_rule"
+                    else service.remove_rich_rule
+                )
+                result = method(
+                    request.zone,
+                    request.source,
+                    request.destination,
+                    request.service,
+                    request.port,
+                    request.protocol,
+                    request.action,
+                    request.target,
                     sudo_password=sudo_password,
                 )
             else:
@@ -1179,6 +1281,11 @@ class ServerController(QObject):
             return (
                 "The interface-zone change completed, but fresh firewall data "
                 "could not be loaded."
+            )
+        if operation in {"add_rich_rule", "remove_rich_rule"}:
+            return (
+                "The rich-rule change completed, but fresh firewall data could "
+                "not be loaded."
             )
         resource = (
             "service"
@@ -1539,6 +1646,8 @@ class ServerController(QObject):
             "remove_service",
             "set_default_zone",
             "change_interface_zone",
+            "add_rich_rule",
+            "remove_rich_rule",
         }:
             if not isinstance(value, _FirewallMutationOutcome):
                 public_error = self._apply_failure(
@@ -1731,6 +1840,8 @@ class ServerController(QObject):
                 "remove_service",
                 "set_default_zone",
                 "change_interface_zone",
+                "add_rich_rule",
+                "remove_rich_rule",
             }
             and isinstance(error, (SSHConnectionError, PostMutationError))
             and session.snapshot is not None
@@ -1789,6 +1900,11 @@ class ServerController(QObject):
                     "The interface-zone change completed, but the requested "
                     "firewall state could not be verified."
                 )
+            elif operation in {"add_rich_rule", "remove_rich_rule"}:
+                message = (
+                    "The rich-rule change completed, but the requested firewall "
+                    "state could not be verified."
+                )
             else:
                 message = (
                     "Firewalld reloaded, but its running state could not be verified."
@@ -1814,6 +1930,11 @@ class ServerController(QObject):
                 message = (
                     "The interface-zone change completed, but fresh firewall data "
                     "could not be loaded."
+                )
+            elif operation in {"add_rich_rule", "remove_rich_rule"}:
+                message = (
+                    "The rich-rule change completed, but fresh firewall data could "
+                    "not be loaded."
                 )
             else:
                 message = (

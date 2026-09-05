@@ -11,6 +11,8 @@ from app.models.change import ChangePreview
 from app.models.port import AddPortRequest
 from app.models.service import AddServiceRequest
 from app.models.interface import ChangeInterfaceRequest
+from app.gui.dialogs.rich_rule_dialog import RichRuleDialog
+from app.models.rich_rule import RichRuleRequest
 
 __all__ = [
     "AddPortDialog",
@@ -24,4 +26,6 @@ __all__ = [
     "ErrorDialog",
     "HostKeyDialog",
     "SudoPasswordDialog",
+    "RichRuleDialog",
+    "RichRuleRequest",
 ]

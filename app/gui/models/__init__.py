@@ -16,6 +16,8 @@ from app.gui.models.services_model import (
 from app.models.service import ServiceRow
 from app.gui.models.interfaces_model import InterfacesTableModel, interface_rows
 from app.models.interface import InterfaceRow
+from app.gui.models.rich_rules_model import RichRulesTableModel, merge_rich_rule_rows
+from app.models.rich_rule import RichRuleRow
 
 __all__ = [
     "PortPresenceFilter",
@@ -31,4 +33,7 @@ __all__ = [
     "InterfaceRow",
     "InterfacesTableModel",
     "interface_rows",
+    "RichRuleRow",
+    "RichRulesTableModel",
+    "merge_rich_rule_rows",
 ]

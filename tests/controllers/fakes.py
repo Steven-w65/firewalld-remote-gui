@@ -253,6 +253,8 @@ class FakeFirewalldService:
         self.next_remove_service_error: Exception | None = None
         self.next_set_default_zone_error: Exception | None = None
         self.next_change_interface_zone_error: Exception | None = None
+        self.next_add_rich_rule_error: Exception | None = None
+        self.next_remove_rich_rule_error: Exception | None = None
         self.next_reload_result = CompositeOperationResult(
             operation="reload_firewalld",
             permanent=TargetResult(
@@ -291,6 +293,8 @@ class FakeFirewalldService:
         self.change_interface_zone_calls: list[
             tuple[str, str, ApplyTarget, str | None]
         ] = []
+        self.add_rich_rule_calls: list[tuple[object, ...]] = []
+        self.remove_rich_rule_calls: list[tuple[object, ...]] = []
         self.operation_trace: list[str] = []
         self.next_add_port_result = _successful_result("add_port")
         self.next_remove_port_result = _successful_result("remove_port")
@@ -300,12 +304,16 @@ class FakeFirewalldService:
         self.next_change_interface_zone_result = _successful_result(
             "change_interface_zone"
         )
+        self.next_add_rich_rule_result = _successful_result("add_rich_rule")
+        self.next_remove_rich_rule_result = _successful_result("remove_rich_rule")
         self.add_port_entered: Event | None = None
         self.add_port_release: Event | None = None
         self.add_service_entered: Event | None = None
         self.add_service_release: Event | None = None
         self.change_interface_entered: Event | None = None
         self.change_interface_release: Event | None = None
+        self.add_rich_rule_entered: Event | None = None
+        self.add_rich_rule_release: Event | None = None
 
     def load_snapshot(
         self, *, sudo_password: str | None = None
@@ -465,6 +473,76 @@ class FakeFirewalldService:
             self.next_change_interface_zone_error = None
             raise error
         return self.next_change_interface_zone_result
+
+    def add_rich_rule(
+        self,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.add_rich_rule_calls.append(
+            (
+                zone,
+                source,
+                destination,
+                service,
+                port,
+                protocol,
+                action,
+                target,
+                sudo_password,
+            )
+        )
+        self.operation_trace.append("add_rich_rule")
+        if self.add_rich_rule_entered is not None:
+            self.add_rich_rule_entered.set()
+        if self.add_rich_rule_release is not None:
+            assert self.add_rich_rule_release.wait(3)
+        if self.next_add_rich_rule_error is not None:
+            error = self.next_add_rich_rule_error
+            self.next_add_rich_rule_error = None
+            raise error
+        return self.next_add_rich_rule_result
+
+    def remove_rich_rule(
+        self,
+        zone: str,
+        source: str | None,
+        destination: str | None,
+        service: str | None,
+        port: str | None,
+        protocol: str | None,
+        action: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.remove_rich_rule_calls.append(
+            (
+                zone,
+                source,
+                destination,
+                service,
+                port,
+                protocol,
+                action,
+                target,
+                sudo_password,
+            )
+        )
+        self.operation_trace.append("remove_rich_rule")
+        if self.next_remove_rich_rule_error is not None:
+            error = self.next_remove_rich_rule_error
+            self.next_remove_rich_rule_error = None
+            raise error
+        return self.next_remove_rich_rule_result
 
 
 class ServiceFactory:

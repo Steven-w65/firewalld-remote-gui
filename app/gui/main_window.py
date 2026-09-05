@@ -31,12 +31,14 @@ from app.gui.dialogs import (
     ConfirmationDialog,
     ErrorDialog,
     HostKeyDialog,
+    RichRuleDialog,
     SudoPasswordDialog,
 )
 from app.gui.overview_tab import OverviewTab
 from app.gui.ports_tab import PortsTab
 from app.gui.services_tab import ServicesTab
 from app.gui.interfaces_tab import InterfacesTab
+from app.gui.rich_rules_tab import RichRulesTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
 from app.gui.zones_tab import ZonesTab
@@ -47,6 +49,7 @@ from app.models.firewall import FirewallSnapshot
 from app.models.port import PortRow
 from app.models.service import ServiceRow
 from app.models.interface import InterfaceRow
+from app.models.rich_rule import RichRuleRow
 
 
 _TAB_NAMES = (
@@ -105,6 +108,7 @@ class MainWindow(QMainWindow):
         self.services_tab = ServicesTab()
         self.zones_tab = ZonesTab()
         self.interfaces_tab = InterfacesTab()
+        self.rich_rules_tab = RichRulesTab()
         self.state_panels: list[StatePanel] = []
 
         header = QHBoxLayout()
@@ -125,6 +129,8 @@ class MainWindow(QMainWindow):
                 self.tabs.addTab(self.zones_tab, tab_name)
             elif tab_name == "Interfaces":
                 self.tabs.addTab(self.interfaces_tab, tab_name)
+            elif tab_name == "Rich Rules":
+                self.tabs.addTab(self.rich_rules_tab, tab_name)
             else:
                 panel = StatePanel(tab_name)
                 self.state_panels.append(panel)
@@ -178,6 +184,11 @@ class MainWindow(QMainWindow):
         self.interfaces_tab.refresh_requested.connect(self._refresh_selected)
         self.interfaces_tab.change_requested.connect(
             self._change_interface_zone_selected
+        )
+        self.rich_rules_tab.refresh_requested.connect(self._refresh_selected)
+        self.rich_rules_tab.add_requested.connect(self._add_rich_rule_selected)
+        self.rich_rules_tab.remove_requested.connect(
+            self._remove_rich_rule_selected
         )
         self.refresh_action.triggered.connect(self._refresh_selected)
         self.reload_configuration_action.triggered.connect(
@@ -542,6 +553,73 @@ class MainWindow(QMainWindow):
         except (KeyError, TypeError, RuntimeError, ValueError):
             return
 
+    @Slot()
+    def _add_rich_rule_selected(self) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view):
+            return
+        assert view is not None and view.snapshot is not None
+        dialog = RichRuleDialog(
+            self.rich_rules_tab.available_zones(),
+            view.snapshot.available_services,
+            self.rich_rules_tab.zone_combo.currentText(),
+            self,
+        )
+        dialog.exec()
+        request = dialog.request()
+        if request is None:
+            return
+        current = self._selected_view()
+        if (
+            current is None
+            or current.server_id != view.server_id
+            or current.generation != view.generation
+        ):
+            return
+        try:
+            preview = self._firewall_controller.preview_add_rich_rule(
+                view.server_id, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_rich_rule_intent_error(view.server_id, "add_rich_rule")
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_add_rich_rule(
+                view.server_id, preview, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
+    @Slot(object)
+    def _remove_rich_rule_selected(self, row: object) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view) or not isinstance(
+            row, RichRuleRow
+        ):
+            return
+        target = self.rich_rules_tab.target_for_row(row)
+        try:
+            preview = self._firewall_controller.preview_remove_rich_rule(
+                view.server_id, row, target
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_rich_rule_intent_error(view.server_id, "remove_rich_rule")
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_remove_rich_rule(
+                view.server_id, preview, row, target
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
     @Slot(str, object)
     def _firewall_snapshot_changed(
         self, server_id: str, snapshot: object
@@ -561,6 +639,7 @@ class MainWindow(QMainWindow):
             self.services_tab.show_operation_result(result)
             self.zones_tab.show_operation_result(result)
             self.interfaces_tab.show_operation_result(result)
+            self.rich_rules_tab.show_operation_result(result)
 
     @staticmethod
     def _port_view_is_actionable(view: ServerSessionView | None) -> bool:
@@ -591,6 +670,15 @@ class MainWindow(QMainWindow):
             server_id,
             "change_interface_zone",
             "The selected interface or firewall state changed before submission.",
+        )
+
+    def _show_rich_rule_intent_error(
+        self, server_id: str, operation: str
+    ) -> None:
+        self._show_firewall_intent_error(
+            server_id,
+            operation,
+            "The selected rich rule or firewall state changed before submission.",
         )
 
     def _show_firewall_intent_error(
@@ -655,6 +743,7 @@ class MainWindow(QMainWindow):
         self.services_tab.set_session(view)
         self.zones_tab.set_session(view)
         self.interfaces_tab.set_session(view)
+        self.rich_rules_tab.set_session(view)
         for panel in self.state_panels:
             panel.set_session(view)
         if view is None:

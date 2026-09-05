@@ -6,6 +6,7 @@ from .firewall import FirewallPort, FirewallSnapshot, InterfaceAssignment, RichR
 from .interface import ChangeInterfaceRequest, InterfaceRow
 from .port import AddPortRequest, PortRow
 from .service import AddServiceRequest, ServiceRow
+from .rich_rule import RichRuleRequest, RichRuleRow
 
 __all__ = [
     "ApplyTarget",
@@ -22,6 +23,8 @@ __all__ = [
     "InterfaceRow",
     "PortRow",
     "RichRule",
+    "RichRuleRequest",
+    "RichRuleRow",
     "ServiceRow",
     "TargetResult",
     "TargetStatus",
