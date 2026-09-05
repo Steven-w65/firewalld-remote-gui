@@ -24,6 +24,7 @@ from app.models.change import ChangePreview
 from app.models.command import CompositeOperationResult, TargetResult
 from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
+from app.models.interface import ChangeInterfaceRequest
 from app.models.port import AddPortRequest, PortRow
 from app.models.service import AddServiceRequest, ServiceRow
 from app.utils.errors import InvalidFirewallArgumentError
@@ -44,6 +45,20 @@ _DEFAULT_ZONE_RISK = LockoutRisk(
         "Changing the default zone affects traffic that is not assigned to another "
         "zone. Review the destination zone before applying this global change.",
     ),
+)
+
+_ACTIVE_INTERFACE_RISK = LockoutRisk(
+    RiskLevel.HIGH,
+    (
+        "This is an active interface. Changing its zone may interrupt the SSH "
+        "connection because the client cannot reliably identify the SSH route's "
+        "egress interface.",
+    ),
+)
+
+_INACTIVE_INTERFACE_RISK = LockoutRisk(
+    RiskLevel.NONE,
+    ("The selected interface is not active in the current runtime snapshot.",),
 )
 
 
@@ -74,7 +89,7 @@ class _PendingFirewallIntent:
 
 
 class FirewallController(QObject):
-    """Validate snapshots, schedule typed port writes, and publish safe outcomes."""
+    """Validate snapshots, schedule typed firewall writes, and publish safe outcomes."""
 
     operation_result = Signal(str, object)
     snapshot_changed = Signal(str, object)
@@ -238,6 +253,57 @@ class FirewallController(QObject):
             server_id=view.server_id,
             generation=view.generation,
         )
+
+    def preview_change_interface_zone(
+        self, server_id: str, request: ChangeInterfaceRequest
+    ) -> ChangePreview:
+        if not isinstance(request, ChangeInterfaceRequest):
+            raise TypeError("request must be a ChangeInterfaceRequest")
+        view, snapshot = self._actionable_snapshot(
+            server_id, "change an interface zone"
+        )
+        runtime = self._interface_assignments(snapshot, permanent=False)
+        permanent = self._interface_assignments(snapshot, permanent=True)
+        if request.interface not in runtime and request.interface not in permanent:
+            raise InvalidFirewallArgumentError(
+                "interface", "is absent from the current firewall snapshot"
+            )
+        assignments = tuple(
+            permanent.get(request.interface)
+            if target_permanent
+            else runtime.get(request.interface)
+            for target_permanent in self._target_permanence(request.target)
+        )
+        if request.target is ApplyTarget.BOTH and assignments[0] != assignments[1]:
+            raise InvalidFirewallArgumentError(
+                "target",
+                "runtime and permanent assignments differ; choose one target",
+            )
+        if any(current != request.current_zone for current in assignments):
+            raise InvalidFirewallArgumentError(
+                "current_zone", "does not match the current snapshot assignment"
+            )
+        for target_permanent in self._target_permanence(request.target):
+            if snapshot.zone(request.new_zone, target_permanent) is None:
+                raise InvalidFirewallArgumentError(
+                    "new_zone", "is absent from a requested target inventory"
+                )
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Change Interface Zone",
+            zone=f"{request.current_zone or 'Unassigned'} → {request.new_zone}",
+            resource=request.interface,
+            target=request.target,
+            risk=(
+                _ACTIVE_INTERFACE_RISK
+                if request.interface in runtime
+                else _INACTIVE_INTERFACE_RISK
+            ),
+            server_id=view.server_id,
+            generation=view.generation,
+        )
+
     def apply_add_port(
         self,
         server_id: str,
@@ -394,6 +460,39 @@ class FirewallController(QObject):
             target,
         )
 
+    def apply_change_interface_zone(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+        request: ChangeInterfaceRequest,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        if not isinstance(request, ChangeInterfaceRequest):
+            raise TypeError("request must be a ChangeInterfaceRequest")
+        self._require_selected(server_id)
+        try:
+            current = self.preview_change_interface_zone(server_id, request)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The selected interface or firewall inventory changed after "
+                "confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        generation = current.generation
+        if generation is None:
+            raise RuntimeError("The confirmed preview has no session generation.")
+        internal = self.server_controller._schedule_interface_change(
+            server_id,
+            generation,
+            request.interface,
+            request.new_zone,
+            request.target,
+        )
+        return self._bind_internal(
+            server_id, generation, "change_interface_zone", internal
+        )
+
     def _schedule(
         self,
         server_id: str,
@@ -443,6 +542,23 @@ class FirewallController(QObject):
             target,
         )
         return self._bind_internal(server_id, generation, operation, internal)
+
+    @staticmethod
+    def _interface_assignments(
+        snapshot: FirewallSnapshot, *, permanent: bool
+    ) -> dict[str, str]:
+        assignments: dict[str, str] = {}
+        zones = snapshot.permanent_zones if permanent else snapshot.runtime_zones
+        for zone in zones:
+            for interface in zone.interfaces:
+                existing = assignments.get(interface)
+                if existing is not None and existing != zone.name:
+                    raise InvalidFirewallArgumentError(
+                        "interface",
+                        "has multiple zone assignments in one snapshot target",
+                    )
+                assignments[interface] = zone.name
+        return assignments
 
     def _bind_internal(
         self,

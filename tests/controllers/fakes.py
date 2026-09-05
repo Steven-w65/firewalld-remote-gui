@@ -252,6 +252,7 @@ class FakeFirewalldService:
         self.next_add_service_error: Exception | None = None
         self.next_remove_service_error: Exception | None = None
         self.next_set_default_zone_error: Exception | None = None
+        self.next_change_interface_zone_error: Exception | None = None
         self.next_reload_result = CompositeOperationResult(
             operation="reload_firewalld",
             permanent=TargetResult(
@@ -287,16 +288,24 @@ class FakeFirewalldService:
         self.set_default_zone_calls: list[
             tuple[str, ApplyTarget, str | None]
         ] = []
+        self.change_interface_zone_calls: list[
+            tuple[str, str, ApplyTarget, str | None]
+        ] = []
         self.operation_trace: list[str] = []
         self.next_add_port_result = _successful_result("add_port")
         self.next_remove_port_result = _successful_result("remove_port")
         self.next_add_service_result = _successful_result("add_service")
         self.next_remove_service_result = _successful_result("remove_service")
         self.next_set_default_zone_result = _successful_result("set_default_zone")
+        self.next_change_interface_zone_result = _successful_result(
+            "change_interface_zone"
+        )
         self.add_port_entered: Event | None = None
         self.add_port_release: Event | None = None
         self.add_service_entered: Event | None = None
         self.add_service_release: Event | None = None
+        self.change_interface_entered: Event | None = None
+        self.change_interface_release: Event | None = None
 
     def load_snapshot(
         self, *, sudo_password: str | None = None
@@ -434,6 +443,28 @@ class FakeFirewalldService:
             self.next_set_default_zone_error = None
             raise error
         return self.next_set_default_zone_result
+
+    def change_interface_zone(
+        self,
+        interface: str,
+        zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.change_interface_zone_calls.append(
+            (interface, zone, target, sudo_password)
+        )
+        self.operation_trace.append("change_interface_zone")
+        if self.change_interface_entered is not None:
+            self.change_interface_entered.set()
+        if self.change_interface_release is not None:
+            assert self.change_interface_release.wait(3)
+        if self.next_change_interface_zone_error is not None:
+            error = self.next_change_interface_zone_error
+            self.next_change_interface_zone_error = None
+            raise error
+        return self.next_change_interface_zone_result
 
 
 class ServiceFactory:

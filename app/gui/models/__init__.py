@@ -14,6 +14,8 @@ from app.gui.models.services_model import (
     merge_service_rows,
 )
 from app.models.service import ServiceRow
+from app.gui.models.interfaces_model import InterfacesTableModel, interface_rows
+from app.models.interface import InterfaceRow
 
 __all__ = [
     "PortPresenceFilter",
@@ -26,4 +28,7 @@ __all__ = [
     "ServicesFilterProxyModel",
     "ServicesTableModel",
     "merge_service_rows",
+    "InterfaceRow",
+    "InterfacesTableModel",
+    "interface_rows",
 ]

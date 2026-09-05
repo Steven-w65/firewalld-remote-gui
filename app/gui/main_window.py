@@ -27,6 +27,7 @@ from app.firewalld.service import ConnectionTestResult
 from app.gui.dialogs import (
     AddPortDialog,
     AddServiceDialog,
+    ChangeInterfaceDialog,
     ConfirmationDialog,
     ErrorDialog,
     HostKeyDialog,
@@ -35,6 +36,7 @@ from app.gui.dialogs import (
 from app.gui.overview_tab import OverviewTab
 from app.gui.ports_tab import PortsTab
 from app.gui.services_tab import ServicesTab
+from app.gui.interfaces_tab import InterfacesTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
 from app.gui.zones_tab import ZonesTab
@@ -44,6 +46,7 @@ from app.models.command import CompositeOperationResult
 from app.models.firewall import FirewallSnapshot
 from app.models.port import PortRow
 from app.models.service import ServiceRow
+from app.models.interface import InterfaceRow
 
 
 _TAB_NAMES = (
@@ -101,6 +104,7 @@ class MainWindow(QMainWindow):
         self.ports_tab = PortsTab()
         self.services_tab = ServicesTab()
         self.zones_tab = ZonesTab()
+        self.interfaces_tab = InterfacesTab()
         self.state_panels: list[StatePanel] = []
 
         header = QHBoxLayout()
@@ -119,6 +123,8 @@ class MainWindow(QMainWindow):
                 self.tabs.addTab(self.services_tab, tab_name)
             elif tab_name == "Zones":
                 self.tabs.addTab(self.zones_tab, tab_name)
+            elif tab_name == "Interfaces":
+                self.tabs.addTab(self.interfaces_tab, tab_name)
             else:
                 panel = StatePanel(tab_name)
                 self.state_panels.append(panel)
@@ -168,6 +174,10 @@ class MainWindow(QMainWindow):
         self.zones_tab.refresh_requested.connect(self._refresh_selected)
         self.zones_tab.set_default_requested.connect(
             self._set_default_zone_selected
+        )
+        self.interfaces_tab.refresh_requested.connect(self._refresh_selected)
+        self.interfaces_tab.change_requested.connect(
+            self._change_interface_zone_selected
         )
         self.refresh_action.triggered.connect(self._refresh_selected)
         self.reload_configuration_action.triggered.connect(
@@ -486,6 +496,52 @@ class MainWindow(QMainWindow):
         except (KeyError, TypeError, RuntimeError, ValueError):
             return
 
+    @Slot(object)
+    def _change_interface_zone_selected(self, row: object) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view) or not isinstance(
+            row, InterfaceRow
+        ):
+            return
+        assert view is not None and view.snapshot is not None
+        runtime_zones = tuple(zone.name for zone in view.snapshot.runtime_zones)
+        permanent_zones = tuple(zone.name for zone in view.snapshot.permanent_zones)
+        try:
+            dialog = ChangeInterfaceDialog.for_row(
+                row, runtime_zones, permanent_zones, self
+            )
+        except (TypeError, ValueError):
+            self._show_interface_intent_error(view.server_id)
+            return
+        dialog.exec()
+        request = dialog.request()
+        if request is None:
+            return
+        current = self._selected_view()
+        if (
+            current is None
+            or current.server_id != view.server_id
+            or current.generation != view.generation
+        ):
+            return
+        try:
+            preview = self._firewall_controller.preview_change_interface_zone(
+                view.server_id, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_interface_intent_error(view.server_id)
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_change_interface_zone(
+                view.server_id, preview, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
     @Slot(str, object)
     def _firewall_snapshot_changed(
         self, server_id: str, snapshot: object
@@ -504,6 +560,7 @@ class MainWindow(QMainWindow):
             self.ports_tab.show_operation_result(result)
             self.services_tab.show_operation_result(result)
             self.zones_tab.show_operation_result(result)
+            self.interfaces_tab.show_operation_result(result)
 
     @staticmethod
     def _port_view_is_actionable(view: ServerSessionView | None) -> bool:
@@ -527,6 +584,13 @@ class MainWindow(QMainWindow):
             server_id,
             operation,
             "The selected service or firewall state changed before submission.",
+        )
+
+    def _show_interface_intent_error(self, server_id: str) -> None:
+        self._show_firewall_intent_error(
+            server_id,
+            "change_interface_zone",
+            "The selected interface or firewall state changed before submission.",
         )
 
     def _show_firewall_intent_error(
@@ -590,6 +654,7 @@ class MainWindow(QMainWindow):
         self.ports_tab.set_session(view)
         self.services_tab.set_session(view)
         self.zones_tab.set_session(view)
+        self.interfaces_tab.set_session(view)
         for panel in self.state_panels:
             panel.set_session(view)
         if view is None:

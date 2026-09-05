@@ -116,6 +116,15 @@ class _Service(Protocol):
         sudo_password: str | None = None,
     ) -> CompositeOperationResult: ...
 
+    def change_interface_zone(
+        self,
+        interface: str,
+        zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
 
 class _HostKeyStore(Protocol):
     def trust(self, challenge: object) -> None: ...
@@ -325,8 +334,21 @@ class _ServiceChangeIntent:
     target: ApplyTarget
 
 
+@dataclass(frozen=True, slots=True)
+class _InterfaceChangeIntent:
+    server_id: str
+    generation: int
+    operation: str
+    interface: str
+    zone: str
+    target: ApplyTarget
+
+
 _FirewallChangeIntent = (
-    _PortChangeIntent | _ServiceChangeIntent | _DefaultZoneChangeIntent
+    _PortChangeIntent
+    | _ServiceChangeIntent
+    | _DefaultZoneChangeIntent
+    | _InterfaceChangeIntent
 )
 
 
@@ -758,6 +780,42 @@ class ServerController(QObject):
         self._launch_firewall_attempt(logical)
         return logical.public
 
+    def _schedule_interface_change(
+        self,
+        server_id: str,
+        generation: int,
+        interface: str,
+        zone: str,
+        target: ApplyTarget,
+    ) -> ControllerJobHandle:
+        """Schedule one validated interface-zone intent without live resources."""
+        operation = "change_interface_zone"
+        session = self._live_idle_session(server_id, operation)
+        if generation != session.generation:
+            raise RuntimeError(
+                "The server session changed before the interface operation."
+            )
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        intent = _InterfaceChangeIntent(
+            server_id=server_id,
+            generation=generation,
+            operation=operation,
+            interface=validate_inventory_token("interface", interface),
+            zone=validate_inventory_token("zone", zone),
+            target=target,
+        )
+        key = (server_id, generation, operation)
+        if key in self._firewall_jobs:
+            raise RuntimeError("A matching interface operation is already pending.")
+        logical = _LogicalFirewallJob(
+            intent=intent,
+            public=ControllerJobHandle(server_id, generation, operation),
+        )
+        self._firewall_jobs[key] = logical
+        self._launch_firewall_attempt(logical)
+        return logical.public
+
     def reload_configuration(self) -> ConfigDiff | None:
         """Load then reconcile atomically; invalid input changes no session state."""
         try:
@@ -918,6 +976,7 @@ class ServerController(QObject):
             "add_service",
             "remove_service",
             "set_default_zone",
+            "change_interface_zone",
         }:
             logical = self._firewall_jobs.get(
                 (request.server_id, request.generation, request.operation)
@@ -986,6 +1045,13 @@ class ServerController(QObject):
                 result = method(
                     intent.zone,
                     intent.service,
+                    intent.target,
+                    sudo_password=sudo_password,
+                )
+            elif isinstance(intent, _InterfaceChangeIntent):
+                result = service.change_interface_zone(
+                    intent.interface,
+                    intent.zone,
                     intent.target,
                     sudo_password=sudo_password,
                 )
@@ -1107,6 +1173,11 @@ class ServerController(QObject):
         if operation == "set_default_zone":
             return (
                 "The default-zone change completed, but fresh firewall data "
+                "could not be loaded."
+            )
+        if operation == "change_interface_zone":
+            return (
+                "The interface-zone change completed, but fresh firewall data "
                 "could not be loaded."
             )
         resource = (
@@ -1467,6 +1538,7 @@ class ServerController(QObject):
             "add_service",
             "remove_service",
             "set_default_zone",
+            "change_interface_zone",
         }:
             if not isinstance(value, _FirewallMutationOutcome):
                 public_error = self._apply_failure(
@@ -1658,6 +1730,7 @@ class ServerController(QObject):
                 "add_service",
                 "remove_service",
                 "set_default_zone",
+                "change_interface_zone",
             }
             and isinstance(error, (SSHConnectionError, PostMutationError))
             and session.snapshot is not None
@@ -1711,6 +1784,11 @@ class ServerController(QObject):
                     "The port change completed, but the requested firewall state "
                     "could not be verified."
                 )
+            elif operation == "change_interface_zone":
+                message = (
+                    "The interface-zone change completed, but the requested "
+                    "firewall state could not be verified."
+                )
             else:
                 message = (
                     "Firewalld reloaded, but its running state could not be verified."
@@ -1731,6 +1809,11 @@ class ServerController(QObject):
                 message = (
                     "The port change completed, but fresh firewall data could not be "
                     "loaded."
+                )
+            elif operation == "change_interface_zone":
+                message = (
+                    "The interface-zone change completed, but fresh firewall data "
+                    "could not be loaded."
                 )
             else:
                 message = (
