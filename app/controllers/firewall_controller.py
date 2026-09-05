@@ -47,19 +47,21 @@ _DEFAULT_ZONE_RISK = LockoutRisk(
     ),
 )
 
-_ACTIVE_INTERFACE_RISK = LockoutRisk(
-    RiskLevel.HIGH,
-    (
-        "This is an active interface. Changing its zone may interrupt the SSH "
-        "connection because the client cannot reliably identify the SSH route's "
-        "egress interface.",
-    ),
-)
-
 _INACTIVE_INTERFACE_RISK = LockoutRisk(
     RiskLevel.NONE,
     ("The selected interface is not active in the current runtime snapshot.",),
 )
+
+
+def _active_interface_risk(management_port: int) -> LockoutRisk:
+    return LockoutRisk(
+        RiskLevel.HIGH,
+        (
+            "This is an active interface. Changing its zone may interrupt SSH "
+            f"access on management port {management_port} because the client "
+            "cannot reliably identify the SSH route's egress interface.",
+        ),
+    )
 
 
 class FirewallJobHandle(QObject):
@@ -296,7 +298,7 @@ class FirewallController(QObject):
             resource=request.interface,
             target=request.target,
             risk=(
-                _ACTIVE_INTERFACE_RISK
+                _active_interface_risk(view.port)
                 if request.interface in runtime
                 else _INACTIVE_INTERFACE_RISK
             ),

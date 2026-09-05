@@ -147,8 +147,13 @@ def connected(qapp):
     managers = ManagerFactory()
     services = ServiceFactory()
     services.next_snapshots["web01"] = _snapshot()
+    loaded = make_loaded("web01", "db01")
+    loaded = replace(
+        loaded,
+        servers=(replace(loaded.servers[0], port=2222), loaded.servers[1]),
+    )
     server = ServerController(
-        FakeConfigManager(make_loaded("web01", "db01")),
+        FakeConfigManager(loaded),
         scheduler,
         managers,
         services,
@@ -176,8 +181,11 @@ def test_preview_change_interface_zone_is_exact_and_active_is_high_risk(
     assert preview.risk.is_high
     warning = " ".join(preview.risk.reasons).lower()
     assert "active interface" in warning
+    assert "management port 2222" in warning
     assert "ssh route" in warning
     assert "cannot reliably identify" in warning
+    assert "ssh-web01-secret" not in warning
+    assert firewall.preview_change_interface_zone("web01", request) == preview
 
 
 @pytest.mark.parametrize(
@@ -363,6 +371,9 @@ def test_main_window_replaces_only_interfaces_placeholder_and_confirms_change(
     window.interfaces_tab.table.selectRow(0)
     window.interfaces_tab.change_button.click()
     assert previews and previews[0].risk.is_high
+    confirmation_warning = " ".join(previews[0].risk.reasons).lower()
+    assert "management port 2222" in confirmation_warning
+    assert "ssh-web01-secret" not in confirmation_warning
     assert server.session_view("web01").busy_operation == "change_interface_zone"
     assert not window.interfaces_tab.change_button.isEnabled()
     scheduler.pending("web01", "change_interface_zone").run_synchronously_for_test()
