@@ -26,6 +26,7 @@ from app.firewalld.lockout import LockoutRisk, RiskLevel
 from app.firewalld.service import ConnectionTestResult
 from app.gui.dialogs import (
     AddPortDialog,
+    AddServiceDialog,
     ConfirmationDialog,
     ErrorDialog,
     HostKeyDialog,
@@ -33,6 +34,7 @@ from app.gui.dialogs import (
 )
 from app.gui.overview_tab import OverviewTab
 from app.gui.ports_tab import PortsTab
+from app.gui.services_tab import ServicesTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
 from app.gui.zones_tab import ZonesTab
@@ -41,6 +43,7 @@ from app.models.enums import ApplyTarget, ConnectionStatus
 from app.models.command import CompositeOperationResult
 from app.models.firewall import FirewallSnapshot
 from app.models.port import PortRow
+from app.models.service import ServiceRow
 
 
 _TAB_NAMES = (
@@ -96,6 +99,7 @@ class MainWindow(QMainWindow):
         self.tabs.setAccessibleName("Firewall management sections")
         self.overview_tab = OverviewTab()
         self.ports_tab = PortsTab()
+        self.services_tab = ServicesTab()
         self.zones_tab = ZonesTab()
         self.state_panels: list[StatePanel] = []
 
@@ -111,7 +115,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.overview_tab, _TAB_NAMES[0])
         self.tabs.addTab(self.ports_tab, _TAB_NAMES[1])
         for tab_name in _TAB_NAMES[2:]:
-            if tab_name == "Zones":
+            if tab_name == "Services":
+                self.tabs.addTab(self.services_tab, tab_name)
+            elif tab_name == "Zones":
                 self.tabs.addTab(self.zones_tab, tab_name)
             else:
                 panel = StatePanel(tab_name)
@@ -154,6 +160,11 @@ class MainWindow(QMainWindow):
         self.ports_tab.refresh_requested.connect(self._ports_refresh_requested)
         self.ports_tab.add_requested.connect(self._add_port_selected)
         self.ports_tab.remove_requested.connect(self._remove_port_selected)
+        self.services_tab.refresh_requested.connect(
+            self._services_refresh_requested
+        )
+        self.services_tab.add_requested.connect(self._add_service_selected)
+        self.services_tab.remove_requested.connect(self._remove_service_selected)
         self.zones_tab.refresh_requested.connect(self._refresh_selected)
         self.zones_tab.set_default_requested.connect(
             self._set_default_zone_selected
@@ -372,6 +383,79 @@ class MainWindow(QMainWindow):
             return
 
     @Slot(str)
+    def _services_refresh_requested(self, zone: str) -> None:
+        del zone
+        self._refresh_selected()
+
+    @Slot()
+    def _add_service_selected(self) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view):
+            return
+        assert view is not None and view.snapshot is not None
+        dialog = AddServiceDialog(
+            view.snapshot.available_services,
+            self.services_tab.available_zones(),
+            self.services_tab.zone_combo.currentText(),
+            self.services_tab.inventory_rows(),
+            self,
+        )
+        dialog.exec()
+        request = dialog.request()
+        if request is None:
+            return
+        current = self._selected_view()
+        if (
+            current is None
+            or current.server_id != view.server_id
+            or current.generation != view.generation
+        ):
+            return
+        try:
+            preview = self._firewall_controller.preview_add_service(
+                view.server_id, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_service_intent_error(view.server_id, "add_service")
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_add_service(
+                view.server_id, preview, request
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
+    @Slot(object)
+    def _remove_service_selected(self, row: object) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view) or not isinstance(
+            row, ServiceRow
+        ):
+            return
+        target = self.services_tab.target_for_row(row)
+        try:
+            preview = self._firewall_controller.preview_remove_service(
+                view.server_id, row, target
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_service_intent_error(view.server_id, "remove_service")
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_remove_service(
+                view.server_id, preview, row, target
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
+    @Slot(str)
     def _set_default_zone_selected(self, new_zone: str) -> None:
         view = self._selected_view()
         if not self._port_view_is_actionable(view):
@@ -418,6 +502,7 @@ class MainWindow(QMainWindow):
             and isinstance(result, CompositeOperationResult)
         ):
             self.ports_tab.show_operation_result(result)
+            self.services_tab.show_operation_result(result)
             self.zones_tab.show_operation_result(result)
 
     @staticmethod
@@ -435,6 +520,13 @@ class MainWindow(QMainWindow):
             server_id,
             operation,
             "The confirmed firewall state changed before submission.",
+        )
+
+    def _show_service_intent_error(self, server_id: str, operation: str) -> None:
+        self._show_firewall_intent_error(
+            server_id,
+            operation,
+            "The selected service or firewall state changed before submission.",
         )
 
     def _show_firewall_intent_error(
@@ -496,6 +588,7 @@ class MainWindow(QMainWindow):
         view = self._selected_view()
         self.overview_tab.set_session(view)
         self.ports_tab.set_session(view)
+        self.services_tab.set_session(view)
         self.zones_tab.set_session(view)
         for panel in self.state_panels:
             panel.set_session(view)

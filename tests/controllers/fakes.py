@@ -249,6 +249,8 @@ class FakeFirewalldService:
         self.next_reload_error: Exception | None = None
         self.next_add_port_error: Exception | None = None
         self.next_remove_port_error: Exception | None = None
+        self.next_add_service_error: Exception | None = None
+        self.next_remove_service_error: Exception | None = None
         self.next_set_default_zone_error: Exception | None = None
         self.next_reload_result = CompositeOperationResult(
             operation="reload_firewalld",
@@ -276,15 +278,25 @@ class FakeFirewalldService:
         self.remove_port_calls: list[
             tuple[str, str, str, ApplyTarget, str | None]
         ] = []
+        self.add_service_calls: list[
+            tuple[str, str, ApplyTarget, str | None]
+        ] = []
+        self.remove_service_calls: list[
+            tuple[str, str, ApplyTarget, str | None]
+        ] = []
         self.set_default_zone_calls: list[
             tuple[str, ApplyTarget, str | None]
         ] = []
         self.operation_trace: list[str] = []
         self.next_add_port_result = _successful_result("add_port")
         self.next_remove_port_result = _successful_result("remove_port")
+        self.next_add_service_result = _successful_result("add_service")
+        self.next_remove_service_result = _successful_result("remove_service")
         self.next_set_default_zone_result = _successful_result("set_default_zone")
         self.add_port_entered: Event | None = None
         self.add_port_release: Event | None = None
+        self.add_service_entered: Event | None = None
+        self.add_service_release: Event | None = None
 
     def load_snapshot(
         self, *, sudo_password: str | None = None
@@ -371,6 +383,42 @@ class FakeFirewalldService:
             self.next_remove_port_error = None
             raise error
         return self.next_remove_port_result
+
+    def add_service(
+        self,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.add_service_calls.append((zone, service, target, sudo_password))
+        self.operation_trace.append("add_service")
+        if self.add_service_entered is not None:
+            self.add_service_entered.set()
+        if self.add_service_release is not None:
+            assert self.add_service_release.wait(3)
+        if self.next_add_service_error is not None:
+            error = self.next_add_service_error
+            self.next_add_service_error = None
+            raise error
+        return self.next_add_service_result
+
+    def remove_service(
+        self,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.remove_service_calls.append((zone, service, target, sudo_password))
+        self.operation_trace.append("remove_service")
+        if self.next_remove_service_error is not None:
+            error = self.next_remove_service_error
+            self.next_remove_service_error = None
+            raise error
+        return self.next_remove_service_result
 
     def set_default_zone(
         self,

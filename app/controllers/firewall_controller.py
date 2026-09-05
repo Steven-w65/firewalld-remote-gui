@@ -16,6 +16,7 @@ from app.controllers.session import ServerSessionView
 from app.firewalld.lockout import (
     LockoutRisk,
     RemovePortChange,
+    RemoveServiceChange,
     RiskLevel,
     assess_lockout_risk,
 )
@@ -24,6 +25,7 @@ from app.models.command import CompositeOperationResult, TargetResult
 from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
 from app.models.port import AddPortRequest, PortRow
+from app.models.service import AddServiceRequest, ServiceRow
 from app.utils.errors import InvalidFirewallArgumentError
 from app.utils.validation import validate_inventory_value
 
@@ -173,6 +175,69 @@ class FirewallController(QObject):
             generation=view.generation,
         )
 
+    def preview_add_service(
+        self, server_id: str, request: AddServiceRequest
+    ) -> ChangePreview:
+        if not isinstance(request, AddServiceRequest):
+            raise TypeError("request must be an AddServiceRequest")
+        view, snapshot = self._actionable_snapshot(server_id, "add a service")
+        self._require_target_zones(snapshot, request.zone, request.target)
+        validate_inventory_value(
+            "service", request.service, snapshot.available_services
+        )
+        if all(
+            snapshot.has_service(request.zone, request.service, permanent)
+            for permanent in self._target_permanence(request.target)
+        ):
+            raise ValueError("The service already exists in every requested target.")
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Add Firewall Service",
+            zone=request.zone,
+            resource=request.service,
+            target=request.target,
+            risk=_INCOMPLETE_ADD_RISK,
+            server_id=view.server_id,
+            generation=view.generation,
+        )
+
+    def preview_remove_service(
+        self,
+        server_id: str,
+        row: ServiceRow,
+        target: ApplyTarget,
+    ) -> ChangePreview:
+        if not isinstance(row, ServiceRow):
+            raise TypeError("row must be a ServiceRow")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        view, snapshot = self._actionable_snapshot(server_id, "remove a service")
+        self._require_target_zones(snapshot, row.zone, target)
+        validate_inventory_value("service", row.name, snapshot.available_services)
+        runtime = snapshot.has_service(row.zone, row.name, False)
+        permanent = snapshot.has_service(row.zone, row.name, True)
+        if row.runtime != runtime or row.permanent != permanent:
+            raise ValueError("The selected service row changed in the current snapshot.")
+        for target_permanent in self._target_permanence(target):
+            if not (permanent if target_permanent else runtime):
+                raise ValueError("The service is absent from a requested remove target.")
+        risk = assess_lockout_risk(
+            RemoveServiceChange(row.zone, row.name),
+            snapshot,
+            ssh_port=view.port,
+        )
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Remove Firewall Service",
+            zone=row.zone,
+            resource=row.name,
+            target=target,
+            risk=risk,
+            server_id=view.server_id,
+            generation=view.generation,
+        )
     def apply_add_port(
         self,
         server_id: str,
@@ -268,6 +333,67 @@ class FirewallController(QObject):
             server_id, generation, "set_default_zone", internal
         )
 
+    def apply_add_service(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+        request: AddServiceRequest,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        if not isinstance(request, AddServiceRequest):
+            raise TypeError("request must be an AddServiceRequest")
+        self._require_selected(server_id)
+        try:
+            current = self.preview_add_service(server_id, request)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The server or firewall inventory changed after confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        view = self.server_controller.session_view(server_id)
+        if view.snapshot is None:
+            raise RuntimeError("The firewall inventory changed after confirmation.")
+        effective_target = self._missing_service_target(view.snapshot, request)
+        return self._schedule_service(
+            server_id,
+            current.generation,
+            "add_service",
+            request.zone,
+            request.service,
+            effective_target,
+        )
+
+    def apply_remove_service(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+        row: ServiceRow,
+        target: ApplyTarget,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        if not isinstance(row, ServiceRow):
+            raise TypeError("row must be a ServiceRow")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        self._require_selected(server_id)
+        try:
+            current = self.preview_remove_service(server_id, row, target)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The server, selection, or firewall inventory changed after confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        return self._schedule_service(
+            server_id,
+            current.generation,
+            "remove_service",
+            row.zone,
+            row.name,
+            target,
+        )
+
     def _schedule(
         self,
         server_id: str,
@@ -290,6 +416,30 @@ class FirewallController(QObject):
             zone,
             port,
             protocol,
+            target,
+        )
+        return self._bind_internal(server_id, generation, operation, internal)
+
+    def _schedule_service(
+        self,
+        server_id: str,
+        generation: int | None,
+        operation: str,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+    ) -> FirewallJobHandle:
+        if generation is None:
+            raise RuntimeError("The confirmed preview has no session generation.")
+        key = (server_id, generation, operation)
+        if key in self._pending:
+            raise RuntimeError("A matching firewall operation is already pending.")
+        internal = self.server_controller._schedule_service_change(
+            server_id,
+            generation,
+            operation,
+            zone,
+            service,
             target,
         )
         return self._bind_internal(server_id, generation, operation, internal)
@@ -461,6 +611,23 @@ class FirewallController(QObject):
         for permanent in cls._target_permanence(target):
             if snapshot.zone(zone, permanent) is None:
                 raise ValueError("The zone is absent from a requested target inventory.")
+
+    @classmethod
+    def _missing_service_target(
+        cls, snapshot: FirewallSnapshot, request: AddServiceRequest
+    ) -> ApplyTarget:
+        missing = tuple(
+            permanent
+            for permanent in cls._target_permanence(request.target)
+            if not snapshot.has_service(request.zone, request.service, permanent)
+        )
+        if missing == (True, False):
+            return ApplyTarget.BOTH
+        if missing == (True,):
+            return ApplyTarget.PERMANENT
+        if missing == (False,):
+            return ApplyTarget.RUNTIME
+        raise RuntimeError("The service is already present in every requested target.")
 
     @staticmethod
     def _require_exact_preview(

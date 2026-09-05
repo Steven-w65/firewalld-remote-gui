@@ -88,3 +88,7 @@ class FirewallSnapshot:
             return False
         normalized_protocol = protocol.lower()
         return any(item.port == port and item.protocol == normalized_protocol for item in state.ports)
+
+    def has_service(self, zone: str, service: str, permanent: bool) -> bool:
+        state = self.zone(zone, permanent)
+        return state is not None and service in state.services

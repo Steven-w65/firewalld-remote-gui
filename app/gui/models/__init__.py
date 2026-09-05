@@ -7,6 +7,13 @@ from app.gui.models.ports_model import (
     merge_port_rows,
 )
 from app.models.port import PortRow
+from app.gui.models.services_model import (
+    ServicePresenceFilter,
+    ServicesFilterProxyModel,
+    ServicesTableModel,
+    merge_service_rows,
+)
+from app.models.service import ServiceRow
 
 __all__ = [
     "PortPresenceFilter",
@@ -14,4 +21,9 @@ __all__ = [
     "PortsFilterProxyModel",
     "PortsTableModel",
     "merge_port_rows",
+    "ServicePresenceFilter",
+    "ServiceRow",
+    "ServicesFilterProxyModel",
+    "ServicesTableModel",
+    "merge_service_rows",
 ]

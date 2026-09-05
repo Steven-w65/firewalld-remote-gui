@@ -90,6 +90,24 @@ class _Service(Protocol):
         sudo_password: str | None = None,
     ) -> CompositeOperationResult: ...
 
+    def add_service(
+        self,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
+    def remove_service(
+        self,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
     def set_default_zone(
         self,
         zone: str,
@@ -297,7 +315,19 @@ class _DefaultZoneChangeIntent:
     target: ApplyTarget
 
 
-_FirewallChangeIntent = _PortChangeIntent | _DefaultZoneChangeIntent
+@dataclass(frozen=True, slots=True)
+class _ServiceChangeIntent:
+    server_id: str
+    generation: int
+    operation: str
+    zone: str
+    service: str
+    target: ApplyTarget
+
+
+_FirewallChangeIntent = (
+    _PortChangeIntent | _ServiceChangeIntent | _DefaultZoneChangeIntent
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,6 +720,44 @@ class ServerController(QObject):
         self._launch_firewall_attempt(logical)
         return logical.public
 
+    def _schedule_service_change(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        zone: str,
+        service: str,
+        target: ApplyTarget,
+    ) -> ControllerJobHandle:
+        """Schedule one validated service intent without exposing live resources."""
+        session = self._live_idle_session(server_id, operation)
+        if generation != session.generation:
+            raise RuntimeError(
+                "The server session changed before the service operation."
+            )
+        if operation not in {"add_service", "remove_service"}:
+            raise ValueError("Unsupported service operation.")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        intent = _ServiceChangeIntent(
+            server_id=server_id,
+            generation=generation,
+            operation=operation,
+            zone=validate_inventory_token("zone", zone),
+            service=validate_inventory_token("service", service),
+            target=target,
+        )
+        key = (server_id, generation, operation)
+        if key in self._firewall_jobs:
+            raise RuntimeError("A matching service operation is already pending.")
+        logical = _LogicalFirewallJob(
+            intent=intent,
+            public=ControllerJobHandle(server_id, generation, operation),
+        )
+        self._firewall_jobs[key] = logical
+        self._launch_firewall_attempt(logical)
+        return logical.public
+
     def reload_configuration(self) -> ConfigDiff | None:
         """Load then reconcile atomically; invalid input changes no session state."""
         try:
@@ -844,7 +912,13 @@ class ServerController(QObject):
             key = (request.server_id, request.generation, request.operation)
             self._sudo_retry_jobs.add(key)
             return self.reload_firewalld(request.server_id)
-        if request.operation in {"add_port", "remove_port", "set_default_zone"}:
+        if request.operation in {
+            "add_port",
+            "remove_port",
+            "add_service",
+            "remove_service",
+            "set_default_zone",
+        }:
             logical = self._firewall_jobs.get(
                 (request.server_id, request.generation, request.operation)
             )
@@ -900,6 +974,18 @@ class ServerController(QObject):
                     intent.zone,
                     intent.port,
                     intent.protocol,
+                    intent.target,
+                    sudo_password=sudo_password,
+                )
+            elif isinstance(intent, _ServiceChangeIntent):
+                method = (
+                    service.add_service
+                    if intent.operation == "add_service"
+                    else service.remove_service
+                )
+                result = method(
+                    intent.zone,
+                    intent.service,
                     intent.target,
                     sudo_password=sudo_password,
                 )
@@ -1023,9 +1109,14 @@ class ServerController(QObject):
                 "The default-zone change completed, but fresh firewall data "
                 "could not be loaded."
             )
+        resource = (
+            "service"
+            if operation in {"add_service", "remove_service"}
+            else "port"
+        )
         return (
-            "The port change completed, but fresh firewall data could not be "
-            "loaded."
+            f"The {resource} change completed, but fresh firewall data could not "
+            "be loaded."
         )
 
     def _firewall_attempt_started(
@@ -1370,7 +1461,13 @@ class ServerController(QObject):
             session.latest_error = None
             self.session_changed.emit(server_id)
             public_value = value
-        elif operation in {"add_port", "remove_port", "set_default_zone"}:
+        elif operation in {
+            "add_port",
+            "remove_port",
+            "add_service",
+            "remove_service",
+            "set_default_zone",
+        }:
             if not isinstance(value, _FirewallMutationOutcome):
                 public_error = self._apply_failure(
                     session,
@@ -1554,7 +1651,14 @@ class ServerController(QObject):
         ):
             session.snapshot = replace(session.snapshot, stale=True)
         if (
-            operation in {"add_port", "remove_port", "set_default_zone"}
+            operation
+            in {
+                "add_port",
+                "remove_port",
+                "add_service",
+                "remove_service",
+                "set_default_zone",
+            }
             and isinstance(error, (SSHConnectionError, PostMutationError))
             and session.snapshot is not None
         ):
@@ -1592,20 +1696,46 @@ class ServerController(QObject):
             category, message = "sudo_required", "Sudo authentication is required."
         elif isinstance(error, PostMutationVerificationError):
             category = "post_mutation_verification"
-            message = (
-                "The default-zone change completed, but the requested default zone "
-                "could not be verified."
-                if operation == "set_default_zone"
-                else "Firewalld reloaded, but its running state could not be verified."
-            )
+            if operation == "set_default_zone":
+                message = (
+                    "The default-zone change completed, but the requested default "
+                    "zone could not be verified."
+                )
+            elif operation in {"add_service", "remove_service"}:
+                message = (
+                    "The service change completed, but the requested firewall state "
+                    "could not be verified."
+                )
+            elif operation in {"add_port", "remove_port"}:
+                message = (
+                    "The port change completed, but the requested firewall state "
+                    "could not be verified."
+                )
+            else:
+                message = (
+                    "Firewalld reloaded, but its running state could not be verified."
+                )
         elif isinstance(error, PostMutationRefreshError):
             category = "post_mutation_refresh"
-            message = (
-                "The default-zone change completed, but fresh firewall data could "
-                "not be loaded."
-                if operation == "set_default_zone"
-                else "Firewalld reloaded, but fresh firewall data could not be loaded."
-            )
+            if operation == "set_default_zone":
+                message = (
+                    "The default-zone change completed, but fresh firewall data could "
+                    "not be loaded."
+                )
+            elif operation in {"add_service", "remove_service"}:
+                message = (
+                    "The service change completed, but fresh firewall data could not "
+                    "be loaded."
+                )
+            elif operation in {"add_port", "remove_port"}:
+                message = (
+                    "The port change completed, but fresh firewall data could not be "
+                    "loaded."
+                )
+            else:
+                message = (
+                    "Firewalld reloaded, but fresh firewall data could not be loaded."
+                )
         elif isinstance(error, PermissionDeniedError):
             category, message = "permission", "The remote operation was not authorized."
         elif isinstance(error, FirewalldNotInstalledError):
