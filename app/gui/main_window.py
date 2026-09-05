@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
@@ -20,7 +22,10 @@ from app.controllers.server_controller import (
     ServerController,
     SudoPasswordRequest,
 )
-from app.controllers.firewall_controller import FirewallController
+from app.controllers.firewall_controller import (
+    FirewallController,
+    FirewallJobHandle,
+)
 from app.controllers.session import ServerSessionView
 from app.firewalld.service import ConnectionTestResult
 from app.gui.dialogs import (
@@ -89,6 +94,7 @@ class MainWindow(QMainWindow):
         )
         self._shutdown_complete = False
         self._shutdown_result = True
+        self._reload_facades: dict[tuple[str, int, str], FirewallJobHandle] = {}
         self.current_server_id: str | None = controller.selected_server_id
         self.setWindowTitle("Remote firewalld Manager")
         self.resize(1100, 720)
@@ -328,19 +334,25 @@ class MainWindow(QMainWindow):
             handle = self._firewall_controller.apply_reload(server_id, preview)
         except (KeyError, TypeError, RuntimeError, ValueError):
             return
-        handle.succeeded.connect(self._reload_operation_result)
+        key = (handle.server_id, handle.generation, handle.operation)
+        self._reload_facades[key] = handle
+        handle.succeeded.connect(partial(self._reload_operation_result, handle))
+        handle.finished.connect(partial(self._reload_operation_finished, handle))
 
-    @Slot(str, int, str, object)
     def _reload_operation_result(
         self,
+        handle: FirewallJobHandle,
         server_id: str,
         generation: int,
         operation: str,
         result: object,
     ) -> None:
+        key = (server_id, generation, operation)
         view = self._selected_view()
         if (
-            view is None
+            self._reload_facades.get(key) is not handle
+            or (handle.server_id, handle.generation, handle.operation) != key
+            or view is None
             or server_id != self.current_server_id
             or view.server_id != server_id
             or view.generation != generation
@@ -351,6 +363,20 @@ class MainWindow(QMainWindow):
         ):
             return
         self.overview_tab.show_reload_result(result)
+
+    def _reload_operation_finished(
+        self,
+        handle: FirewallJobHandle,
+        server_id: str,
+        generation: int,
+        operation: str,
+    ) -> None:
+        key = (server_id, generation, operation)
+        if (
+            self._reload_facades.get(key) is handle
+            and (handle.server_id, handle.generation, handle.operation) == key
+        ):
+            self._reload_facades.pop(key, None)
 
     @Slot(str)
     def _clear_logs_view(self, server_id: str) -> None:

@@ -404,6 +404,84 @@ def test_completed_reload_handle_cannot_overwrite_overview_with_late_same_genera
     assert window.overview_tab.reload_result_label.text() == expected
 
 
+def test_late_reload_facade_cannot_render_or_finish_a_new_same_identity_reload(
+    reload_workflow, qtbot, monkeypatch
+) -> None:
+    server, firewall, scheduler, service = reload_workflow
+    window = MainWindow(server, firewall)
+    qtbot.addWidget(window)
+
+    class AcceptedConfirmation:
+        def __init__(self, _preview, parent=None):
+            assert parent is window
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def confirmed(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.gui.main_window.ConfirmationDialog", AcceptedConfirmation
+    )
+    rendered: list[CompositeOperationResult] = []
+    original_show_reload_result = window.overview_tab.show_reload_result
+
+    def record_reload_result(result: CompositeOperationResult) -> None:
+        rendered.append(result)
+        original_show_reload_result(result)
+
+    monkeypatch.setattr(
+        window.overview_tab, "show_reload_result", record_reload_result
+    )
+
+    old_result = service.next_reload_result
+    window.overview_tab.reload_button.click()
+    old_facade = firewall._pending[("web01", 0, "reload_firewalld")].facade
+    scheduler.pending("web01", "reload_firewalld").run_synchronously_for_test()
+    assert len(rendered) == 1
+
+    failed_result = CompositeOperationResult(
+        "reload_firewalld",
+        permanent=_unsafe_target(
+            ApplyTarget.PERMANENT,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+        ),
+        runtime=_unsafe_target(
+            ApplyTarget.RUNTIME,
+            TargetStatus.FAILED,
+            TargetStatus.NOT_RUN,
+        ),
+    )
+    service.next_reload_result = failed_result
+    window.overview_tab.reload_button.click()
+    current_facade = firewall._pending[("web01", 0, "reload_firewalld")].facade
+    current_finishes = QSignalSpy(current_facade.finished)
+    rendered.clear()
+
+    old_facade.succeeded.emit("web01", 0, "reload_firewalld", old_result)
+    old_facade.finished.emit("web01", 0, "reload_firewalld")
+
+    assert rendered == []
+    assert window.overview_tab.reload_result_label.text() == ""
+
+    scheduler.pending("web01", "reload_firewalld").run_synchronously_for_test()
+
+    assert len(rendered) == 1
+    assert rendered[0].permanent is not None
+    assert rendered[0].runtime is not None
+    assert rendered[0].permanent.execution_status is TargetStatus.FAILED
+    assert rendered[0].runtime.execution_status is TargetStatus.FAILED
+    assert "secret" not in repr(rendered[0])
+    assert current_finishes.count() == 1
+    assert "did not complete" in window.overview_tab.reload_result_label.text()
+
+    current_facade.succeeded.emit("web01", 0, "reload_firewalld", failed_result)
+    current_facade.finished.emit("web01", 0, "reload_firewalld")
+    assert len(rendered) == 1
+
+
 def test_reload_refresh_failure_keeps_prior_snapshot_stale_and_safe_error(
     reload_workflow,
 ) -> None:
