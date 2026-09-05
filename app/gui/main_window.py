@@ -22,7 +22,6 @@ from app.controllers.server_controller import (
 )
 from app.controllers.firewall_controller import FirewallController
 from app.controllers.session import ServerSessionView
-from app.firewalld.lockout import LockoutRisk, RiskLevel
 from app.firewalld.service import ConnectionTestResult
 from app.gui.dialogs import (
     AddPortDialog,
@@ -35,6 +34,7 @@ from app.gui.dialogs import (
     SudoPasswordDialog,
 )
 from app.gui.overview_tab import OverviewTab
+from app.gui.logs_tab import LogsTab
 from app.gui.ports_tab import PortsTab
 from app.gui.services_tab import ServicesTab
 from app.gui.interfaces_tab import InterfacesTab
@@ -42,7 +42,6 @@ from app.gui.rich_rules_tab import RichRulesTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
 from app.gui.zones_tab import ZonesTab
-from app.models.change import ChangePreview
 from app.models.enums import ApplyTarget, ConnectionStatus
 from app.models.command import CompositeOperationResult
 from app.models.firewall import FirewallSnapshot
@@ -109,6 +108,7 @@ class MainWindow(QMainWindow):
         self.zones_tab = ZonesTab()
         self.interfaces_tab = InterfacesTab()
         self.rich_rules_tab = RichRulesTab()
+        self.logs_tab = LogsTab()
         self.state_panels: list[StatePanel] = []
 
         header = QHBoxLayout()
@@ -131,6 +131,8 @@ class MainWindow(QMainWindow):
                 self.tabs.addTab(self.interfaces_tab, tab_name)
             elif tab_name == "Rich Rules":
                 self.tabs.addTab(self.rich_rules_tab, tab_name)
+            elif tab_name == "Logs":
+                self.tabs.addTab(self.logs_tab, tab_name)
             else:
                 panel = StatePanel(tab_name)
                 self.state_panels.append(panel)
@@ -190,6 +192,9 @@ class MainWindow(QMainWindow):
         self.rich_rules_tab.remove_requested.connect(
             self._remove_rich_rule_selected
         )
+        self.logs_tab.clear_requested.connect(self._clear_logs_view)
+        self.logs_tab.refresh_requested.connect(self._refresh_logs_view)
+        self.logs_tab.copy_requested.connect(self._copy_logs_view)
         self.refresh_action.triggered.connect(self._refresh_selected)
         self.reload_configuration_action.triggered.connect(
             self._controller.reload_configuration
@@ -202,6 +207,7 @@ class MainWindow(QMainWindow):
             self._sudo_password_required
         )
         self._controller.error_raised.connect(self._error_raised)
+        self._controller.log_entries_changed.connect(self._log_entries_changed)
         self._firewall_controller.snapshot_changed.connect(
             self._firewall_snapshot_changed
         )
@@ -309,37 +315,49 @@ class MainWindow(QMainWindow):
             or view.busy_operation is not None
         ):
             return
-        preview = ChangePreview(
-            server_name=view.name,
-            host=view.host,
-            operation="Reload firewalld",
-            zone="Global",
-            resource="firewalld daemon",
-            target=ApplyTarget.BOTH,
-            risk=LockoutRisk(
-                RiskLevel.NONE,
-                (
-                    "Reloading firewalld loads the permanent configuration into "
-                    "runtime and may discard runtime-only changes.",
-                ),
-            ),
-        )
+        try:
+            preview = self._firewall_controller.preview_reload(view.server_id)
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
         server_id = view.server_id
-        generation = view.generation
         dialog = ConfirmationDialog(preview, self)
         dialog.exec()
         if not dialog.confirmed():
             return
-        current = self._selected_view()
-        if (
-            current is None
-            or current.server_id != server_id
-            or current.generation != generation
-            or current.status is not ConnectionStatus.CONNECTED
-            or current.busy_operation is not None
-        ):
+        try:
+            self._firewall_controller.apply_reload(server_id, preview)
+        except (KeyError, TypeError, RuntimeError, ValueError):
             return
-        self._controller.reload_firewalld(server_id)
+
+    @Slot(str)
+    def _clear_logs_view(self, server_id: str) -> None:
+        if server_id != self.current_server_id:
+            return
+        if self.logs_tab.server_id != server_id:
+            return
+
+    @Slot(str)
+    def _refresh_logs_view(self, server_id: str) -> None:
+        if server_id != self.current_server_id:
+            return
+        if self.logs_tab.server_id != server_id:
+            return
+        try:
+            entries = self._controller.log_entries(server_id)
+        except KeyError:
+            return
+        self.logs_tab.set_entries(entries)
+
+    @Slot(str)
+    def _copy_logs_view(self, server_id: str) -> None:
+        if server_id != self.current_server_id:
+            return
+        if self.logs_tab.server_id != server_id:
+            return
+
+    @Slot(str)
+    def _log_entries_changed(self, server_id: str) -> None:
+        self._refresh_logs_view(server_id)
 
     @Slot(str)
     def _ports_refresh_requested(self, zone: str) -> None:
@@ -728,7 +746,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object)
     def _error_raised(self, server_id: str, error: object) -> None:
-        del server_id
+        if server_id and server_id != self.current_server_id:
+            return
         if isinstance(error, ControllerOperationError) and error.category in {
             "host_key_required",
             "sudo_required",
@@ -744,6 +763,12 @@ class MainWindow(QMainWindow):
         self.zones_tab.set_session(view)
         self.interfaces_tab.set_session(view)
         self.rich_rules_tab.set_session(view)
+        self.logs_tab.set_server(None if view is None else view.server_id)
+        if view is not None:
+            try:
+                self.logs_tab.set_entries(self._controller.log_entries(view.server_id))
+            except KeyError:
+                self.logs_tab.set_entries(())
         for panel in self.state_panels:
             panel.set_session(view)
         if view is None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Event, Lock
+from time import monotonic
 from typing import Any, Protocol, cast
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -42,6 +43,7 @@ from app.utils.validation import (
     validate_port,
     validate_protocol,
 )
+from app.utils.logging_setup import ServerLogBuffer
 from app.workers.scheduler import JobHandle
 
 
@@ -309,6 +311,7 @@ class _ConnectedResources:
 class _PublicJobRecord:
     internal: JobHandle[Any]
     public: ControllerJobHandle
+    started_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +357,14 @@ class _DefaultZoneChangeIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReloadIntent:
+    server_id: str
+    generation: int
+    operation: str
+    target: ApplyTarget
+
+
+@dataclass(frozen=True, slots=True)
 class _ServiceChangeIntent:
     server_id: str
     generation: int
@@ -385,6 +396,7 @@ _FirewallChangeIntent = (
     _PortChangeIntent
     | _ServiceChangeIntent
     | _DefaultZoneChangeIntent
+    | _ReloadIntent
     | _InterfaceChangeIntent
     | _RichRuleChangeIntent
 )
@@ -419,6 +431,7 @@ class ServerController(QObject):
     host_key_required = Signal(str, object)
     sudo_password_required = Signal(str, object)
     error_raised = Signal(str, object)
+    log_entries_changed = Signal(str)
 
     def __init__(
         self,
@@ -428,6 +441,7 @@ class ServerController(QObject):
         service_factory: ServiceFactory = FirewalldService,
         *,
         host_key_store: _HostKeyStore | None = None,
+        log_buffer: ServerLogBuffer | None = None,
     ) -> None:
         super().__init__()
         self._config_manager = config_manager
@@ -436,6 +450,13 @@ class ServerController(QObject):
         self._service_factory = service_factory
         self._host_key_store = host_key_store
         self._loaded = config_manager.load()
+        self._log_buffer = log_buffer or ServerLogBuffer(
+            secrets=(server.password for server in self._loaded.servers)
+        )
+        self._log_buffer.add_secrets(
+            server.password for server in self._loaded.servers
+        )
+        self._log_buffer.entries_changed.connect(self._log_buffer_changed)
         self._sessions: dict[str, ServerSession] = {
             config.id: ServerSession(config=config)
             for config in self._loaded.servers
@@ -469,6 +490,16 @@ class ServerController(QObject):
 
     def session_view(self, server_id: str) -> ServerSessionView:
         return self._session(server_id).view()
+
+    def log_entries(self, server_id: str) -> tuple[str, ...]:
+        """Return only sanitized display strings for one current profile."""
+        self._session(server_id)
+        return self._log_buffer.entries(server_id)
+
+    @Slot(str)
+    def _log_buffer_changed(self, server_id: str) -> None:
+        if server_id in self._sessions:
+            self.log_entries_changed.emit(server_id)
 
     def select(self, server_id: str) -> None:
         self._session(server_id)
@@ -680,34 +711,9 @@ class ServerController(QObject):
         )
 
     def reload_firewalld(self, server_id: str) -> ControllerJobHandle:
-        """Run one confirmed global reload, then publish one fresh snapshot."""
+        """Schedule reload through the safe logical firewall lifecycle."""
         session = self._live_idle_session(server_id, "reload_firewalld")
-        service = cast(_Service, session._service)
-        sudo_password = session.sudo_password
-
-        def work() -> FirewallSnapshot:
-            result = service.reload_firewalld(
-                ApplyTarget.BOTH,
-                sudo_password=sudo_password,
-            )
-            if (
-                not isinstance(result, CompositeOperationResult)
-                or result.operation != "reload_firewalld"
-                or not result.is_success
-            ):
-                raise FirewallCommandError(server_id, "reload_firewalld")
-            post_mutation_error: PostMutationRefreshError | None = None
-            try:
-                snapshot = service.load_snapshot(sudo_password=sudo_password)
-            except (SudoAuthenticationError, SudoAuthenticationRequiredError):
-                post_mutation_error = PostMutationRefreshError(
-                    server_id, "reload_firewalld"
-                )
-            if post_mutation_error is not None:
-                raise post_mutation_error
-            return snapshot
-
-        return self._start_service_job(session, "reload_firewalld", work)
+        return self._schedule_reload(server_id, session.generation)
 
     def _schedule_port_change(
         self,
@@ -775,6 +781,33 @@ class ServerController(QObject):
         logical = _LogicalFirewallJob(
             intent=intent,
             public=ControllerJobHandle(server_id, generation, intent.operation),
+        )
+        self._firewall_jobs[key] = logical
+        self._launch_firewall_attempt(logical)
+        return logical.public
+
+    def _schedule_reload(
+        self,
+        server_id: str,
+        generation: int,
+    ) -> ControllerJobHandle:
+        """Schedule one global reload through the logical firewall lifecycle."""
+        operation = "reload_firewalld"
+        session = self._live_idle_session(server_id, operation)
+        if generation != session.generation:
+            raise RuntimeError("The server session changed before the reload operation.")
+        intent = _ReloadIntent(
+            server_id=server_id,
+            generation=generation,
+            operation=operation,
+            target=ApplyTarget.BOTH,
+        )
+        key = (server_id, generation, operation)
+        if key in self._firewall_jobs:
+            raise RuntimeError("A matching reload operation is already pending.")
+        logical = _LogicalFirewallJob(
+            intent=intent,
+            public=ControllerJobHandle(server_id, generation, operation),
         )
         self._firewall_jobs[key] = logical
         self._launch_firewall_attempt(logical)
@@ -907,8 +940,12 @@ class ServerController(QObject):
             return None
 
         diff = ConfigManager.diff(self._loaded, loaded)
+        self._log_buffer.add_secrets(
+            server.password for server in loaded.servers
+        )
         old_sessions = self._sessions
         for server_id in (*diff.changed, *diff.removed):
+            self._log_buffer.clear(server_id)
             old = old_sessions[server_id]
             self._clear_pending_decisions(server_id)
             attempt_manager = self._invalidate_attempt(old)
@@ -1045,14 +1082,8 @@ class ServerController(QObject):
             key = (request.server_id, request.generation, request.operation)
             self._sudo_retry_jobs.add(key)
             return self.test_connection(request.server_id)
-        if request.operation == "reload_firewalld":
-            if session._service is None:
-                return None
-            session.status = ConnectionStatus.CONNECTED
-            key = (request.server_id, request.generation, request.operation)
-            self._sudo_retry_jobs.add(key)
-            return self.reload_firewalld(request.server_id)
         if request.operation in {
+            "reload_firewalld",
             "add_port",
             "remove_port",
             "add_service",
@@ -1107,7 +1138,12 @@ class ServerController(QObject):
         sudo_password = session.sudo_password
 
         def work() -> _FirewallMutationOutcome:
-            if isinstance(intent, _PortChangeIntent):
+            if isinstance(intent, _ReloadIntent):
+                result = service.reload_firewalld(
+                    intent.target,
+                    sudo_password=sudo_password,
+                )
+            elif isinstance(intent, _PortChangeIntent):
                 method = (
                     service.add_port
                     if intent.operation == "add_port"
@@ -1272,6 +1308,10 @@ class ServerController(QObject):
 
     @staticmethod
     def _post_mutation_refresh_message(operation: str) -> str:
+        if operation == "reload_firewalld":
+            return (
+                "Firewalld reloaded, but fresh firewall data could not be loaded."
+            )
         if operation == "set_default_zone":
             return (
                 "The default-zone change completed, but fresh firewall data "
@@ -1573,6 +1613,10 @@ class ServerController(QObject):
         session = self._sessions[server_id]
         if session.busy_operation != operation:
             return
+        record.started_at = monotonic()
+        self._append_job_log(
+            server_id, generation, operation, "started", record.started_at
+        )
         record.public.started.emit(server_id, generation, operation)
 
     @Slot(str, int, str, object)
@@ -1624,7 +1668,7 @@ class ServerController(QObject):
             session.latest_error = None
             self.session_changed.emit(server_id)
             public_value = session.view()
-        elif operation in {"refresh", "reload_firewalld"}:
+        elif operation == "refresh":
             if not isinstance(value, FirewallSnapshot):
                 public_error = self._apply_failure(
                     session,
@@ -1640,6 +1684,7 @@ class ServerController(QObject):
             self.session_changed.emit(server_id)
             public_value = value
         elif operation in {
+            "reload_firewalld",
             "add_port",
             "remove_port",
             "add_service",
@@ -1698,6 +1743,9 @@ class ServerController(QObject):
                 return
             session.latest_error = None
             public_value = value
+        self._append_job_log(
+            server_id, generation, operation, "succeeded", record.started_at
+        )
         record.public.succeeded.emit(
             server_id, generation, operation, public_value
         )
@@ -1720,6 +1768,9 @@ class ServerController(QObject):
         if session.busy_operation != operation:
             return
         public_error = self._apply_failure(session, operation, error)
+        self._append_job_log(
+            server_id, generation, operation, "failed", record.started_at
+        )
         record.public.failed.emit(server_id, generation, operation, public_error)
         self._sudo_retry_jobs.discard((server_id, generation, operation))
 
@@ -1749,6 +1800,34 @@ class ServerController(QObject):
         if request is not None:
             self._accepted_sudo_retries.discard(request)
             self._retry_sudo_operation(request)
+
+    def _append_job_log(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        outcome: str,
+        started_at: float | None,
+    ) -> None:
+        if not self._is_current(server_id, generation):
+            return
+        logical = self._firewall_jobs.get((server_id, generation, operation))
+        target_value = getattr(logical.intent, "target", None) if logical else None
+        target = (
+            "runtime+permanent"
+            if target_value is ApplyTarget.BOTH
+            else target_value.value
+            if isinstance(target_value, ApplyTarget)
+            else "none"
+        )
+        duration = 0.0 if started_at is None else max(0.0, monotonic() - started_at)
+        self._log_buffer.append_message(
+            server_id,
+            (
+                f"server={server_id} operation={operation} target={target} "
+                f"duration={duration:.3f}s outcome={outcome}"
+            ),
+        )
 
     def _launch_trusted_retry(
         self, key: tuple[str, int, str]

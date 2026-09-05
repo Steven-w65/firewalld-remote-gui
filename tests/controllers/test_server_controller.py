@@ -1530,11 +1530,11 @@ def test_reload_runs_one_global_write_then_one_refresh_and_publishes_updated_sna
 
     assert service.reload_calls == [(ApplyTarget.BOTH, None)]
     assert service.operation_trace == ["reload_firewalld", "load_snapshot"]
-    assert observed == [(service.next_snapshot, service.next_snapshot)]
+    assert observed == [(service.next_reload_result, service.next_snapshot)]
     assert controller.session_view("web01").snapshot == service.next_snapshot
 
 
-def test_failed_reload_does_not_refresh_or_retry_and_marks_existing_snapshot_stale(
+def test_failed_reload_result_refreshes_once_and_is_published_without_retry(
     controller, dependencies
 ) -> None:
     _, scheduler, _, service_factory = dependencies
@@ -1559,20 +1559,19 @@ def test_failed_reload_does_not_refresh_or_retry_and_marks_existing_snapshot_sta
             "The firewalld change failed.",
         ),
     )
-    failures: list[object] = []
+    results: list[object] = []
 
     handle = controller.reload_firewalld("web01")
-    handle.failed.connect(
-        lambda _server_id, _generation, _operation, error: failures.append(error)
+    handle.succeeded.connect(
+        lambda _server_id, _generation, _operation, value: results.append(value)
     )
     scheduler.pending("web01", "reload_firewalld").run()
 
     assert service.reload_calls == [(ApplyTarget.BOTH, None)]
-    assert service.operation_trace == ["reload_firewalld"]
-    assert len(failures) == 1
-    assert failures[0].operation == "reload_firewalld"
+    assert service.operation_trace == ["reload_firewalld", "load_snapshot"]
+    assert results == [service.next_reload_result]
     assert controller.session_view("web01").snapshot is not None
-    assert controller.session_view("web01").snapshot.stale
+    assert not controller.session_view("web01").snapshot.stale
 
 
 def test_sudo_reload_retry_is_same_generation_exact_operation_and_happens_once(
@@ -1656,14 +1655,18 @@ def test_reload_post_mutation_refresh_auth_failure_never_prompts_or_reloads(
     service.operation_trace.clear()
     service.next_load_error = refresh_error
     requests: list[object] = []
+    results: list[object] = []
     failures: list[object] = []
     controller.sudo_password_required.connect(
         lambda _server_id, request: requests.append(request)
     )
 
     handle = controller.reload_firewalld("web01")
-    handle.failed.connect(
-        lambda _server_id, _generation, _operation, error: failures.append(error)
+    handle.succeeded.connect(
+        lambda _server_id, _generation, _operation, value: results.append(value)
+    )
+    controller.error_raised.connect(
+        lambda _server_id, error: failures.append(error)
     )
     scheduler.pending("web01", "reload_firewalld").run()
 
@@ -1672,6 +1675,7 @@ def test_reload_post_mutation_refresh_auth_failure_never_prompts_or_reloads(
     ]
     assert service.operation_trace == ["reload_firewalld", "load_snapshot"]
     assert requests == []
+    assert results == [service.next_reload_result]
     assert len(failures) == 1
     assert failures[0].category == "post_mutation_refresh"
     assert "secret" not in repr(failures[0])

@@ -54,6 +54,14 @@ _DEFAULT_ZONE_RISK = LockoutRisk(
     ),
 )
 
+_RELOAD_RISK = LockoutRisk(
+    RiskLevel.NONE,
+    (
+        "Reloading firewalld replaces runtime state with the permanent "
+        "configuration; runtime-only changes may disappear.",
+    ),
+)
+
 _INACTIVE_INTERFACE_RISK = LockoutRisk(
     RiskLevel.NONE,
     ("The selected interface is not active in the current runtime snapshot.",),
@@ -195,6 +203,20 @@ class FirewallController(QObject):
             resource=f"{snapshot.default_zone} → {validated}",
             target=ApplyTarget.BOTH,
             risk=_DEFAULT_ZONE_RISK,
+            server_id=view.server_id,
+            generation=view.generation,
+        )
+
+    def preview_reload(self, server_id: str) -> ChangePreview:
+        view, _snapshot = self._actionable_snapshot(server_id, "reload firewalld")
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Reload firewalld",
+            zone="Global",
+            resource="firewalld daemon",
+            target=ApplyTarget.BOTH,
+            risk=_RELOAD_RISK,
             server_id=view.server_id,
             generation=view.generation,
         )
@@ -473,6 +495,29 @@ class FirewallController(QObject):
         )
         return self._bind_internal(
             server_id, generation, "set_default_zone", internal
+        )
+
+    def apply_reload(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        self._require_selected(server_id)
+        try:
+            current = self.preview_reload(server_id)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The server or firewall inventory changed after confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        generation = current.generation
+        if generation is None:
+            raise RuntimeError("The confirmed preview has no session generation.")
+        internal = self.server_controller._schedule_reload(server_id, generation)
+        return self._bind_internal(
+            server_id, generation, "reload_firewalld", internal
         )
 
     def apply_add_service(

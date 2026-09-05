@@ -71,6 +71,7 @@ class FakeServerController(QObject):
     host_key_required = Signal(str, object)
     sudo_password_required = Signal(str, object)
     error_raised = Signal(str, object)
+    log_entries_changed = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -98,12 +99,18 @@ class FakeServerController(QObject):
         self.shutdown_calls: list[int] = []
         self.host_key_decisions: list[tuple[str, int, object, bool]] = []
         self.sudo_decisions: list[tuple[object, str | None]] = []
+        self._log_entries: dict[str, tuple[str, ...]] = {}
 
     def sessions(self) -> tuple[ServerSessionView, ...]:
         return tuple(self._views[server_id] for server_id in self._order)
 
     def session_view(self, server_id: str) -> ServerSessionView:
         return self._views[server_id]
+
+    def log_entries(self, server_id: str) -> tuple[str, ...]:
+        if server_id not in self._views:
+            raise KeyError(server_id)
+        return self._log_entries.get(server_id, ())
 
     def select(self, server_id: str) -> None:
         self.selected_server_id = server_id
@@ -129,6 +136,13 @@ class FakeServerController(QObject):
     def reload_firewalld(self, server_id: str) -> ControllerJobHandle:
         self.reload_firewalld_calls.append(server_id)
         return self._handle(server_id, "reload_firewalld")
+
+    def _schedule_reload(
+        self, server_id: str, generation: int
+    ) -> ControllerJobHandle:
+        if self._views[server_id].generation != generation:
+            raise RuntimeError("stale generation")
+        return self.reload_firewalld(server_id)
 
     def reload_configuration(self) -> None:
         self.reload_calls += 1
@@ -187,13 +201,13 @@ def test_selecting_server_routes_only_its_frozen_view(window):
 
     assert window.current_server_id == "db01"
     assert window.header_title.text() == "Database Server"
-    assert window.state_panels[0].state_key == "connected"
+    assert window.logs_tab.server_id == "db01"
 
 
 def test_unselected_session_update_does_not_replace_visible_content(
     window, controller
 ):
-    selected_before = window.state_panels[0].message_label.text()
+    selected_before = window.logs_tab.toPlainText()
 
     controller.publish(
         view(
@@ -206,10 +220,10 @@ def test_unselected_session_update_does_not_replace_visible_content(
 
     assert window.current_server_id == "web01"
     assert window.header_title.text() == "Production Web"
-    assert window.state_panels[0].message_label.text() == selected_before
+    assert window.logs_tab.toPlainText() == selected_before
 
 
-def test_shell_has_exact_tab_order_and_accessible_state_panels(window):
+def test_shell_has_exact_tab_order_and_real_management_tabs(window):
     assert tuple(
         window.tabs.tabText(index) for index in range(window.tabs.count())
     ) == (
@@ -226,73 +240,10 @@ def test_shell_has_exact_tab_order_and_accessible_state_panels(window):
     assert window.tabs.widget(3) is window.zones_tab
     assert window.tabs.widget(4) is window.interfaces_tab
     assert window.tabs.widget(5) is window.rich_rules_tab
+    assert window.tabs.widget(6) is window.logs_tab
     assert window.overview_tab.accessibleName() == "Server overview"
-    assert len(window.state_panels) == 1
-    assert all(panel.accessibleName() for panel in window.state_panels)
-
-
-@pytest.mark.parametrize(
-    ("replacement", "state_key", "text"),
-    [
-        (view("web01", "Web"), "disconnected", "Disconnected"),
-        (
-            view(
-                "web01",
-                "Web",
-                ConnectionStatus.CONNECTING,
-                busy_operation="connect",
-            ),
-            "busy",
-            "Connecting",
-        ),
-        (
-            view("web01", "Web", ConnectionStatus.CONNECTED),
-            "empty",
-            "No firewall data",
-        ),
-        (
-            view(
-                "web01",
-                "Web",
-                ConnectionStatus.CONNECTED,
-                current_snapshot=snapshot(hostname="web01"),
-            ),
-            "connected",
-            "Connected",
-        ),
-        (
-            view(
-                "web01",
-                "Web",
-                ConnectionStatus.CONNECTED,
-                current_snapshot=snapshot(hostname="web01", stale=True),
-            ),
-            "stale",
-            "Stale data",
-        ),
-        (
-            view(
-                "web01",
-                "Web",
-                ConnectionStatus.CONNECTION_ERROR,
-                latest_error="unsafe ssh-secret details",
-            ),
-            "error",
-            "Connection error",
-        ),
-    ],
-)
-def test_state_panels_render_safe_icon_and_text(
-    window, controller, replacement, state_key, text
-):
-    controller.publish(replacement)
-
-    panel = window.state_panels[0]
-    assert panel.state_key == state_key
-    assert text in panel.message_label.text()
-    assert panel.icon_label.pixmap() is not None
-    assert not panel.icon_label.pixmap().isNull()
-    assert "ssh-secret" not in panel.message_label.text()
+    assert window.logs_tab.accessibleName() == "Server logs"
+    assert window.state_panels == []
 
 
 def test_menu_and_sidebar_actions_route_selected_id_to_public_controller(
@@ -472,10 +423,7 @@ def test_reload_confirmation_visibly_warns_runtime_only_changes_may_be_discarded
 
     window.overview_tab.reload_button.click()
 
-    assert (
-        "loads the permanent configuration into runtime and may discard "
-        "runtime-only changes"
-    ) in rendered_text[0]
+    assert "runtime-only changes may disappear" in rendered_text[0]
     assert controller.reload_firewalld_calls == []
 
 
@@ -582,7 +530,8 @@ def test_no_sessions_renders_no_selection_state(qtbot):
 
     assert window.current_server_id is None
     assert window.header_title.text() == "No server selected"
-    assert window.state_panels[0].state_key == "no_selection"
+    assert window.logs_tab.server_id is None
+    assert window.logs_tab.toPlainText() == ""
 
 
 def test_shutdown_is_bounded_and_invoked_exactly_once(window, controller):

@@ -14,6 +14,8 @@ from pathlib import Path
 from threading import RLock
 from types import TracebackType
 
+from PySide6.QtCore import QObject, Signal
+
 
 _LOG_FILE_NAME = "remote-firewalld-manager.log"
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -216,25 +218,73 @@ def configure_logging(log_dir: Path, secrets: Iterable[str]) -> logging.Logger:
     return logger
 
 
-class ServerLogBuffer:
+class ServerLogBuffer(QObject):
     """Maintain a bounded, thread-safe in-memory view of per-server log entries."""
 
+    entries_changed = Signal(str)
+
     def __init__(self, max_entries: int = 500, secrets: Iterable[str] = ()) -> None:
+        super().__init__()
         if max_entries < 1:
             raise ValueError("max_entries must be positive")
         self._max_entries = max_entries
         self._entries: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=max_entries))
         self._lock = RLock()
         self._formatter = logging.Formatter(_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
-        self._redaction_filter = SecretRedactionFilter(secrets)
+        self._secrets = {
+            secret
+            for secret in secrets
+            if isinstance(secret, str) and secret.strip()
+        }
+        self._redaction_filter = SecretRedactionFilter(self._secrets)
+
+    def add_secrets(self, secrets: Iterable[str]) -> None:
+        """Add defense-in-depth redaction values without exposing existing ones."""
+        additions = {
+            secret
+            for secret in secrets
+            if isinstance(secret, str) and secret.strip()
+        }
+        if not additions:
+            return
+        with self._lock:
+            self._secrets.update(additions)
+            self._redaction_filter = SecretRedactionFilter(self._secrets)
 
     def append(self, record: logging.LogRecord) -> None:
         server_id = record.server_id if isinstance(getattr(record, "server_id", None), str) else "default"
         sanitized = copy.copy(record)
-        self._redaction_filter.filter(sanitized)
-        entry = self._formatter.format(sanitized)
         with self._lock:
+            self._redaction_filter.filter(sanitized)
+            entry = self._formatter.format(sanitized)
             self._entries[server_id].append(entry)
+        self.entries_changed.emit(server_id)
+
+    def append_message(
+        self,
+        server_id: str,
+        message: str,
+        *,
+        level: int = logging.INFO,
+    ) -> None:
+        """Sanitize and append one already-structured application message."""
+        if not isinstance(server_id, str) or not server_id:
+            raise TypeError("server_id must be a nonempty string")
+        if not isinstance(message, str):
+            raise TypeError("message must be a string")
+        if isinstance(level, bool) or not isinstance(level, int):
+            raise TypeError("level must be an integer logging level")
+        record = logging.LogRecord(
+            "remote_firewalld_manager",
+            level,
+            "",
+            0,
+            message,
+            (),
+            None,
+        )
+        record.server_id = server_id
+        self.append(record)
 
     def entries(self, server_id: str) -> tuple[str, ...]:
         with self._lock:
@@ -244,3 +294,4 @@ class ServerLogBuffer:
         with self._lock:
             if server_id in self._entries:
                 self._entries[server_id].clear()
+        self.entries_changed.emit(server_id)
