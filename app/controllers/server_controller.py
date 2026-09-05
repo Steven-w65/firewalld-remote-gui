@@ -90,6 +90,14 @@ class _Service(Protocol):
         sudo_password: str | None = None,
     ) -> CompositeOperationResult: ...
 
+    def set_default_zone(
+        self,
+        zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult: ...
+
 
 class _HostKeyStore(Protocol):
     def trust(self, challenge: object) -> None: ...
@@ -281,7 +289,19 @@ class _PortChangeIntent:
 
 
 @dataclass(frozen=True, slots=True)
-class _PortMutationOutcome:
+class _DefaultZoneChangeIntent:
+    server_id: str
+    generation: int
+    operation: str
+    zone: str
+    target: ApplyTarget
+
+
+_FirewallChangeIntent = _PortChangeIntent | _DefaultZoneChangeIntent
+
+
+@dataclass(frozen=True, slots=True)
+class _FirewallMutationOutcome:
     result: CompositeOperationResult
     snapshot: FirewallSnapshot | None
     refresh_error: ControllerOperationError | None = None
@@ -290,8 +310,8 @@ class _PortMutationOutcome:
 
 
 @dataclass(slots=True)
-class _LogicalPortJob:
-    intent: _PortChangeIntent
+class _LogicalFirewallJob:
+    intent: _FirewallChangeIntent
     public: ControllerJobHandle
     attempt: ControllerJobHandle | None = None
     last_error: ControllerOperationError | None = None
@@ -344,7 +364,7 @@ class ServerController(QObject):
         ] = {}
         self._accepted_sudo_retries: set[SudoPasswordRequest] = set()
         self._sudo_retry_jobs: set[tuple[str, int, str]] = set()
-        self._port_jobs: dict[tuple[str, int, str], _LogicalPortJob] = {}
+        self._firewall_jobs: dict[tuple[str, int, str], _LogicalFirewallJob] = {}
 
     @property
     def selected_server_id(self) -> str | None:
@@ -451,11 +471,11 @@ class ServerController(QObject):
             or session.status is ConnectionStatus.DISCONNECTED
         ):
             self._pending_sudo.pop(request.server_id, None)
-            self._cancel_port_job(request)
+            self._cancel_firewall_job(request)
             return False
         if not isinstance(password, str) or not password:
             self._pending_sudo.pop(request.server_id, None)
-            self._cancel_port_job(request)
+            self._cancel_firewall_job(request)
             return False
 
         session.sudo_password = password
@@ -627,14 +647,47 @@ class ServerController(QObject):
             target=target,
         )
         key = (server_id, generation, operation)
-        if key in self._port_jobs:
+        if key in self._firewall_jobs:
             raise RuntimeError("A matching port operation is already pending.")
-        logical = _LogicalPortJob(
+        logical = _LogicalFirewallJob(
             intent=intent,
             public=ControllerJobHandle(server_id, generation, operation),
         )
-        self._port_jobs[key] = logical
-        self._launch_port_attempt(logical)
+        self._firewall_jobs[key] = logical
+        self._launch_firewall_attempt(logical)
+        return logical.public
+
+    def _schedule_default_zone_change(
+        self,
+        server_id: str,
+        generation: int,
+        zone: str,
+        target: ApplyTarget,
+    ) -> ControllerJobHandle:
+        """Schedule one validated global default-zone intent privately."""
+        session = self._live_idle_session(server_id, "set_default_zone")
+        if generation != session.generation:
+            raise RuntimeError(
+                "The server session changed before the default-zone operation."
+            )
+        if target is not ApplyTarget.BOTH:
+            raise ValueError("Default-zone changes require both targets.")
+        intent = _DefaultZoneChangeIntent(
+            server_id=server_id,
+            generation=generation,
+            operation="set_default_zone",
+            zone=validate_inventory_token("zone", zone),
+            target=target,
+        )
+        key = (server_id, generation, intent.operation)
+        if key in self._firewall_jobs:
+            raise RuntimeError("A matching firewall operation is already pending.")
+        logical = _LogicalFirewallJob(
+            intent=intent,
+            public=ControllerJobHandle(server_id, generation, intent.operation),
+        )
+        self._firewall_jobs[key] = logical
+        self._launch_firewall_attempt(logical)
         return logical.public
 
     def reload_configuration(self) -> ConfigDiff | None:
@@ -791,8 +844,8 @@ class ServerController(QObject):
             key = (request.server_id, request.generation, request.operation)
             self._sudo_retry_jobs.add(key)
             return self.reload_firewalld(request.server_id)
-        if request.operation in {"add_port", "remove_port"}:
-            logical = self._port_jobs.get(
+        if request.operation in {"add_port", "remove_port", "set_default_zone"}:
+            logical = self._firewall_jobs.get(
                 (request.server_id, request.generation, request.operation)
             )
             if logical is None or logical.completed or session._service is None:
@@ -800,11 +853,11 @@ class ServerController(QObject):
             session.status = ConnectionStatus.CONNECTED
             key = (request.server_id, request.generation, request.operation)
             self._sudo_retry_jobs.add(key)
-            return self._launch_port_attempt(logical)
+            return self._launch_firewall_attempt(logical)
         return None
 
     def _clear_pending_decisions(self, server_id: str) -> None:
-        self._cancel_port_jobs(server_id)
+        self._cancel_firewall_jobs(server_id)
         self._pending_host_keys.pop(server_id, None)
         self._pending_sudo.pop(server_id, None)
         self._clear_pending_trusted_retries(server_id)
@@ -824,29 +877,38 @@ class ServerController(QObject):
             if retry.server_id != server_id
         }
 
-    def _launch_port_attempt(
-        self, logical: _LogicalPortJob
+    def _launch_firewall_attempt(
+        self, logical: _LogicalFirewallJob
     ) -> ControllerJobHandle:
         intent = logical.intent
         session = self._live_idle_session(intent.server_id, intent.operation)
         if session.generation != intent.generation:
-            raise RuntimeError("The server session changed before the port operation.")
+            raise RuntimeError(
+                "The server session changed before the firewall operation."
+            )
         service = cast(_Service, session._service)
         sudo_password = session.sudo_password
 
-        def work() -> _PortMutationOutcome:
-            method = (
-                service.add_port
-                if intent.operation == "add_port"
-                else service.remove_port
-            )
-            result = method(
-                intent.zone,
-                intent.port,
-                intent.protocol,
-                intent.target,
-                sudo_password=sudo_password,
-            )
+        def work() -> _FirewallMutationOutcome:
+            if isinstance(intent, _PortChangeIntent):
+                method = (
+                    service.add_port
+                    if intent.operation == "add_port"
+                    else service.remove_port
+                )
+                result = method(
+                    intent.zone,
+                    intent.port,
+                    intent.protocol,
+                    intent.target,
+                    sudo_password=sudo_password,
+                )
+            else:
+                result = service.set_default_zone(
+                    intent.zone,
+                    intent.target,
+                    sudo_password=sudo_password,
+                )
             if (
                 not isinstance(result, CompositeOperationResult)
                 or result.operation != intent.operation
@@ -860,26 +922,26 @@ class ServerController(QObject):
             try:
                 snapshot = service.load_snapshot(sudo_password=sudo_password)
             except (SudoAuthenticationError, SudoAuthenticationRequiredError):
-                return _PortMutationOutcome(
+                return _FirewallMutationOutcome(
                     result=result,
                     snapshot=None,
                     refresh_error=ControllerOperationError(
                         intent.server_id,
                         intent.operation,
                         "post_mutation_refresh",
-                        "The port change completed, but fresh firewall data could not be loaded.",
+                        self._post_mutation_refresh_message(intent.operation),
                     ),
                     clear_sudo=True,
                 )
             except Exception as error:
-                return _PortMutationOutcome(
+                return _FirewallMutationOutcome(
                     result=result,
                     snapshot=None,
                     refresh_error=ControllerOperationError(
                         intent.server_id,
                         intent.operation,
                         "post_mutation_refresh",
-                        "The port change completed, but fresh firewall data could not be loaded.",
+                        self._post_mutation_refresh_message(intent.operation),
                     ),
                     terminal_transport=isinstance(error, SSHConnectionError),
                     clear_sudo=(
@@ -888,18 +950,18 @@ class ServerController(QObject):
                     ),
                 )
             if not isinstance(snapshot, FirewallSnapshot):
-                return _PortMutationOutcome(
+                return _FirewallMutationOutcome(
                     result=result,
                     snapshot=None,
                     refresh_error=ControllerOperationError(
                         intent.server_id,
                         intent.operation,
                         "post_mutation_refresh",
-                        "The port change completed, but fresh firewall data could not be loaded.",
+                        self._post_mutation_refresh_message(intent.operation),
                     ),
                     clear_sudo=post_mutation_auth_failure,
                 )
-            return _PortMutationOutcome(
+            return _FirewallMutationOutcome(
                 result=result,
                 snapshot=snapshot,
                 clear_sudo=post_mutation_auth_failure,
@@ -909,28 +971,28 @@ class ServerController(QObject):
         logical.attempt = attempt
         attempt.started.connect(
             lambda server_id, generation, operation, current=attempt: (
-                self._port_attempt_started(
+                self._firewall_attempt_started(
                     logical, current, server_id, generation, operation
                 )
             )
         )
         attempt.succeeded.connect(
             lambda server_id, generation, operation, value, current=attempt: (
-                self._port_attempt_succeeded(
+                self._firewall_attempt_succeeded(
                     logical, current, server_id, generation, operation, value
                 )
             )
         )
         attempt.failed.connect(
             lambda server_id, generation, operation, error, current=attempt: (
-                self._port_attempt_failed(
+                self._firewall_attempt_failed(
                     logical, current, server_id, generation, operation, error
                 )
             )
         )
         attempt.finished.connect(
             lambda server_id, generation, operation, current=attempt: (
-                self._port_attempt_finished(
+                self._firewall_attempt_finished(
                     logical, current, server_id, generation, operation
                 )
             )
@@ -938,8 +1000,8 @@ class ServerController(QObject):
         return attempt
 
     @staticmethod
-    def _matches_port_attempt(
-        logical: _LogicalPortJob,
+    def _matches_firewall_attempt(
+        logical: _LogicalFirewallJob,
         attempt: ControllerJobHandle,
         server_id: str,
         generation: int,
@@ -954,15 +1016,27 @@ class ServerController(QObject):
             and intent.operation == operation
         )
 
-    def _port_attempt_started(
+    @staticmethod
+    def _post_mutation_refresh_message(operation: str) -> str:
+        if operation == "set_default_zone":
+            return (
+                "The default-zone change completed, but fresh firewall data "
+                "could not be loaded."
+            )
+        return (
+            "The port change completed, but fresh firewall data could not be "
+            "loaded."
+        )
+
+    def _firewall_attempt_started(
         self,
-        logical: _LogicalPortJob,
+        logical: _LogicalFirewallJob,
         attempt: ControllerJobHandle,
         server_id: str,
         generation: int,
         operation: str,
     ) -> None:
-        if not self._matches_port_attempt(
+        if not self._matches_firewall_attempt(
             logical, attempt, server_id, generation, operation
         ):
             return
@@ -970,16 +1044,16 @@ class ServerController(QObject):
             logical.started_emitted = True
             logical.public.started.emit(server_id, generation, operation)
 
-    def _port_attempt_succeeded(
+    def _firewall_attempt_succeeded(
         self,
-        logical: _LogicalPortJob,
+        logical: _LogicalFirewallJob,
         attempt: ControllerJobHandle,
         server_id: str,
         generation: int,
         operation: str,
         value: object,
     ) -> None:
-        if not self._matches_port_attempt(
+        if not self._matches_firewall_attempt(
             logical, attempt, server_id, generation, operation
         ):
             return
@@ -997,16 +1071,16 @@ class ServerController(QObject):
             logical.public.succeeded.emit(server_id, generation, operation, value)
         logical.outcome_emitted = True
 
-    def _port_attempt_failed(
+    def _firewall_attempt_failed(
         self,
-        logical: _LogicalPortJob,
+        logical: _LogicalFirewallJob,
         attempt: ControllerJobHandle,
         server_id: str,
         generation: int,
         operation: str,
         error: object,
     ) -> None:
-        if not self._matches_port_attempt(
+        if not self._matches_firewall_attempt(
             logical, attempt, server_id, generation, operation
         ):
             return
@@ -1043,20 +1117,20 @@ class ServerController(QObject):
         logical.public.failed.emit(server_id, generation, operation, public_error)
         logical.outcome_emitted = True
 
-    def _port_attempt_finished(
+    def _firewall_attempt_finished(
         self,
-        logical: _LogicalPortJob,
+        logical: _LogicalFirewallJob,
         attempt: ControllerJobHandle,
         server_id: str,
         generation: int,
         operation: str,
     ) -> None:
-        if not self._matches_port_attempt(
+        if not self._matches_firewall_attempt(
             logical, attempt, server_id, generation, operation
         ):
             return
         if logical.outcome_emitted:
-            self._finish_port_job(logical)
+            self._finish_firewall_job(logical)
             return
         pending = self._pending_sudo.get(server_id)
         if (
@@ -1075,23 +1149,23 @@ class ServerController(QObject):
                 server_id, generation, operation, logical.last_error
             )
             logical.outcome_emitted = True
-            self._finish_port_job(logical)
+            self._finish_firewall_job(logical)
 
-    def _finish_port_job(self, logical: _LogicalPortJob) -> None:
+    def _finish_firewall_job(self, logical: _LogicalFirewallJob) -> None:
         if logical.completed:
             return
         logical.completed = True
         intent = logical.intent
         key = (intent.server_id, intent.generation, intent.operation)
-        if self._port_jobs.get(key) is logical:
-            del self._port_jobs[key]
+        if self._firewall_jobs.get(key) is logical:
+            del self._firewall_jobs[key]
         self._sudo_retry_jobs.discard(key)
         logical.public.finished.emit(
             intent.server_id, intent.generation, intent.operation
         )
 
-    def _cancel_port_job(self, request: SudoPasswordRequest) -> None:
-        logical = self._port_jobs.get(
+    def _cancel_firewall_job(self, request: SudoPasswordRequest) -> None:
+        logical = self._firewall_jobs.get(
             (request.server_id, request.generation, request.operation)
         )
         if logical is None or logical.completed:
@@ -1106,10 +1180,10 @@ class ServerController(QObject):
             request.server_id, request.generation, request.operation, error
         )
         logical.outcome_emitted = True
-        self._finish_port_job(logical)
+        self._finish_firewall_job(logical)
 
-    def _cancel_port_jobs(self, server_id: str) -> None:
-        for logical in tuple(self._port_jobs.values()):
+    def _cancel_firewall_jobs(self, server_id: str) -> None:
+        for logical in tuple(self._firewall_jobs.values()):
             if logical.intent.server_id != server_id or logical.completed:
                 continue
             error = ControllerOperationError(
@@ -1125,7 +1199,7 @@ class ServerController(QObject):
                 error,
             )
             logical.outcome_emitted = True
-            self._finish_port_job(logical)
+            self._finish_firewall_job(logical)
 
     def _submit_connection(
         self,
@@ -1296,12 +1370,12 @@ class ServerController(QObject):
             session.latest_error = None
             self.session_changed.emit(server_id)
             public_value = value
-        elif operation in {"add_port", "remove_port"}:
-            if not isinstance(value, _PortMutationOutcome):
+        elif operation in {"add_port", "remove_port", "set_default_zone"}:
+            if not isinstance(value, _FirewallMutationOutcome):
                 public_error = self._apply_failure(
                     session,
                     operation,
-                    TypeError("port operation returned invalid state"),
+                    TypeError("firewall operation returned invalid state"),
                 )
                 record.public.failed.emit(
                     server_id, generation, operation, public_error
@@ -1480,8 +1554,8 @@ class ServerController(QObject):
         ):
             session.snapshot = replace(session.snapshot, stale=True)
         if (
-            operation in {"add_port", "remove_port"}
-            and isinstance(error, SSHConnectionError)
+            operation in {"add_port", "remove_port", "set_default_zone"}
+            and isinstance(error, (SSHConnectionError, PostMutationError))
             and session.snapshot is not None
         ):
             session.snapshot = replace(session.snapshot, stale=True)
@@ -1517,14 +1591,20 @@ class ServerController(QObject):
         elif isinstance(error, SudoAuthenticationRequiredError):
             category, message = "sudo_required", "Sudo authentication is required."
         elif isinstance(error, PostMutationVerificationError):
-            category, message = (
-                "post_mutation_verification",
-                "Firewalld reloaded, but its running state could not be verified.",
+            category = "post_mutation_verification"
+            message = (
+                "The default-zone change completed, but the requested default zone "
+                "could not be verified."
+                if operation == "set_default_zone"
+                else "Firewalld reloaded, but its running state could not be verified."
             )
         elif isinstance(error, PostMutationRefreshError):
-            category, message = (
-                "post_mutation_refresh",
-                "Firewalld reloaded, but fresh firewall data could not be loaded.",
+            category = "post_mutation_refresh"
+            message = (
+                "The default-zone change completed, but fresh firewall data could "
+                "not be loaded."
+                if operation == "set_default_zone"
+                else "Firewalld reloaded, but fresh firewall data could not be loaded."
             )
         elif isinstance(error, PermissionDeniedError):
             category, message = "permission", "The remote operation was not authorized."

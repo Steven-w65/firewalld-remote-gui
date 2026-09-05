@@ -24,6 +24,8 @@ from app.models.command import CompositeOperationResult, TargetResult
 from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
 from app.models.port import AddPortRequest, PortRow
+from app.utils.errors import InvalidFirewallArgumentError
+from app.utils.validation import validate_inventory_value
 
 
 _INCOMPLETE_ADD_RISK = LockoutRisk(
@@ -31,6 +33,14 @@ _INCOMPLETE_ADD_RISK = LockoutRisk(
     (
         "No recognized SSH lockout risk was found for this addition. Detection "
         "is incomplete and does not guarantee that a firewall change is safe.",
+    ),
+)
+
+_DEFAULT_ZONE_RISK = LockoutRisk(
+    RiskLevel.NONE,
+    (
+        "Changing the default zone affects traffic that is not assigned to another "
+        "zone. Review the destination zone before applying this global change.",
     ),
 )
 
@@ -51,7 +61,7 @@ class FirewallJobHandle(QObject):
 
 
 @dataclass(slots=True)
-class _PendingPortIntent:
+class _PendingFirewallIntent:
     server_id: str
     generation: int
     operation: str
@@ -71,7 +81,7 @@ class FirewallController(QObject):
     def __init__(self, server_controller: ServerController) -> None:
         super().__init__()
         self.server_controller = server_controller
-        self._pending: dict[tuple[str, int, str], _PendingPortIntent] = {}
+        self._pending: dict[tuple[str, int, str], _PendingFirewallIntent] = {}
         server_controller.error_raised.connect(self._forward_matching_error)
 
     def preview_add_port(
@@ -130,6 +140,35 @@ class FirewallController(QObject):
             resource=f"{row.port}/{row.protocol}",
             target=target,
             risk=risk,
+            server_id=view.server_id,
+            generation=view.generation,
+        )
+
+    def preview_set_default_zone(
+        self, server_id: str, new_zone: str
+    ) -> ChangePreview:
+        view, snapshot = self._actionable_snapshot(
+            server_id, "change the default zone"
+        )
+        available = tuple(
+            dict.fromkeys(
+                zone.name
+                for zone in snapshot.runtime_zones + snapshot.permanent_zones
+            )
+        )
+        validated = validate_inventory_value("zone", new_zone, available)
+        if validated == snapshot.default_zone:
+            raise InvalidFirewallArgumentError(
+                "zone", "must differ from the current default zone"
+            )
+        return ChangePreview(
+            server_name=view.name,
+            host=view.host,
+            operation="Set Default Zone",
+            zone="Global",
+            resource=f"{snapshot.default_zone} → {validated}",
+            target=ApplyTarget.BOTH,
+            risk=_DEFAULT_ZONE_RISK,
             server_id=view.server_id,
             generation=view.generation,
         )
@@ -193,6 +232,42 @@ class FirewallController(QObject):
             target,
         )
 
+    def apply_set_default_zone(
+        self,
+        server_id: str,
+        preview: ChangePreview,
+        new_zone: str,
+        target: ApplyTarget,
+    ) -> FirewallJobHandle:
+        if not isinstance(preview, ChangePreview):
+            raise TypeError("preview must be a ChangePreview")
+        if not isinstance(target, ApplyTarget):
+            raise TypeError("target must be an ApplyTarget")
+        if target is not ApplyTarget.BOTH:
+            raise InvalidFirewallArgumentError(
+                "target", "default-zone changes require runtime and permanent"
+            )
+        self._require_selected(server_id)
+        try:
+            current = self.preview_set_default_zone(server_id, new_zone)
+        except (KeyError, RuntimeError, ValueError):
+            raise RuntimeError(
+                "The server or firewall inventory changed after confirmation."
+            ) from None
+        self._require_exact_preview(server_id, preview, current)
+        generation = current.generation
+        if generation is None:
+            raise RuntimeError("The confirmed preview has no session generation.")
+        internal = self.server_controller._schedule_default_zone_change(
+            server_id,
+            generation,
+            new_zone,
+            target,
+        )
+        return self._bind_internal(
+            server_id, generation, "set_default_zone", internal
+        )
+
     def _schedule(
         self,
         server_id: str,
@@ -217,8 +292,20 @@ class FirewallController(QObject):
             protocol,
             target,
         )
+        return self._bind_internal(server_id, generation, operation, internal)
+
+    def _bind_internal(
+        self,
+        server_id: str,
+        generation: int,
+        operation: str,
+        internal: ControllerJobHandle,
+    ) -> FirewallJobHandle:
+        key = (server_id, generation, operation)
+        if key in self._pending:
+            raise RuntimeError("A matching firewall operation is already pending.")
         facade = FirewallJobHandle(server_id, generation, operation)
-        pending = _PendingPortIntent(
+        pending = _PendingFirewallIntent(
             server_id, generation, operation, facade, internal
         )
         self._pending[key] = pending
@@ -327,7 +414,7 @@ class FirewallController(QObject):
         server_id: str,
         generation: int,
         operation: str,
-    ) -> _PendingPortIntent | None:
+    ) -> _PendingFirewallIntent | None:
         pending = self._pending.get((server_id, generation, operation))
         if pending is None or pending.internal is not internal:
             return None

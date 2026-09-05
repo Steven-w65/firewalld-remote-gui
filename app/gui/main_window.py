@@ -35,6 +35,7 @@ from app.gui.overview_tab import OverviewTab
 from app.gui.ports_tab import PortsTab
 from app.gui.server_sidebar import ServerSidebar, status_presentation
 from app.gui.widgets.state_panel import StatePanel
+from app.gui.zones_tab import ZonesTab
 from app.models.change import ChangePreview
 from app.models.enums import ApplyTarget, ConnectionStatus
 from app.models.command import CompositeOperationResult
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
         self.tabs.setAccessibleName("Firewall management sections")
         self.overview_tab = OverviewTab()
         self.ports_tab = PortsTab()
+        self.zones_tab = ZonesTab()
         self.state_panels: list[StatePanel] = []
 
         header = QHBoxLayout()
@@ -109,9 +111,12 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.overview_tab, _TAB_NAMES[0])
         self.tabs.addTab(self.ports_tab, _TAB_NAMES[1])
         for tab_name in _TAB_NAMES[2:]:
-            panel = StatePanel(tab_name)
-            self.state_panels.append(panel)
-            self.tabs.addTab(panel, tab_name)
+            if tab_name == "Zones":
+                self.tabs.addTab(self.zones_tab, tab_name)
+            else:
+                panel = StatePanel(tab_name)
+                self.state_panels.append(panel)
+                self.tabs.addTab(panel, tab_name)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("mainSplitter")
@@ -149,6 +154,10 @@ class MainWindow(QMainWindow):
         self.ports_tab.refresh_requested.connect(self._ports_refresh_requested)
         self.ports_tab.add_requested.connect(self._add_port_selected)
         self.ports_tab.remove_requested.connect(self._remove_port_selected)
+        self.zones_tab.refresh_requested.connect(self._refresh_selected)
+        self.zones_tab.set_default_requested.connect(
+            self._set_default_zone_selected
+        )
         self.refresh_action.triggered.connect(self._refresh_selected)
         self.reload_configuration_action.triggered.connect(
             self._controller.reload_configuration
@@ -362,6 +371,37 @@ class MainWindow(QMainWindow):
         except (KeyError, TypeError, RuntimeError, ValueError):
             return
 
+    @Slot(str)
+    def _set_default_zone_selected(self, new_zone: str) -> None:
+        view = self._selected_view()
+        if not self._port_view_is_actionable(view):
+            return
+        assert view is not None
+        try:
+            preview = self._firewall_controller.preview_set_default_zone(
+                view.server_id, new_zone
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            self._show_firewall_intent_error(
+                view.server_id,
+                "set_default_zone",
+                "The selected default zone is no longer available.",
+            )
+            return
+        confirmation = ConfirmationDialog(preview, self)
+        confirmation.exec()
+        if not confirmation.confirmed():
+            return
+        try:
+            self._firewall_controller.apply_set_default_zone(
+                view.server_id,
+                preview,
+                new_zone,
+                ApplyTarget.BOTH,
+            )
+        except (KeyError, TypeError, RuntimeError, ValueError):
+            return
+
     @Slot(str, object)
     def _firewall_snapshot_changed(
         self, server_id: str, snapshot: object
@@ -378,6 +418,7 @@ class MainWindow(QMainWindow):
             and isinstance(result, CompositeOperationResult)
         ):
             self.ports_tab.show_operation_result(result)
+            self.zones_tab.show_operation_result(result)
 
     @staticmethod
     def _port_view_is_actionable(view: ServerSessionView | None) -> bool:
@@ -390,12 +431,21 @@ class MainWindow(QMainWindow):
         )
 
     def _show_port_intent_error(self, server_id: str, operation: str) -> None:
+        self._show_firewall_intent_error(
+            server_id,
+            operation,
+            "The confirmed firewall state changed before submission.",
+        )
+
+    def _show_firewall_intent_error(
+        self, server_id: str, operation: str, message: str
+    ) -> None:
         ErrorDialog.from_domain_error(
             ControllerOperationError(
                 server_id,
                 operation,
                 "operation",
-                "The confirmed firewall state changed before submission.",
+                message,
             ),
             self,
         ).exec()
@@ -446,6 +496,7 @@ class MainWindow(QMainWindow):
         view = self._selected_view()
         self.overview_tab.set_session(view)
         self.ports_tab.set_session(view)
+        self.zones_tab.set_session(view)
         for panel in self.state_panels:
             panel.set_session(view)
         if view is None:

@@ -249,6 +249,7 @@ class FakeFirewalldService:
         self.next_reload_error: Exception | None = None
         self.next_add_port_error: Exception | None = None
         self.next_remove_port_error: Exception | None = None
+        self.next_set_default_zone_error: Exception | None = None
         self.next_reload_result = CompositeOperationResult(
             operation="reload_firewalld",
             permanent=TargetResult(
@@ -275,9 +276,13 @@ class FakeFirewalldService:
         self.remove_port_calls: list[
             tuple[str, str, str, ApplyTarget, str | None]
         ] = []
+        self.set_default_zone_calls: list[
+            tuple[str, ApplyTarget, str | None]
+        ] = []
         self.operation_trace: list[str] = []
         self.next_add_port_result = _successful_result("add_port")
         self.next_remove_port_result = _successful_result("remove_port")
+        self.next_set_default_zone_result = _successful_result("set_default_zone")
         self.add_port_entered: Event | None = None
         self.add_port_release: Event | None = None
 
@@ -366,6 +371,21 @@ class FakeFirewalldService:
             self.next_remove_port_error = None
             raise error
         return self.next_remove_port_result
+
+    def set_default_zone(
+        self,
+        zone: str,
+        target: ApplyTarget,
+        *,
+        sudo_password: str | None = None,
+    ) -> CompositeOperationResult:
+        self.set_default_zone_calls.append((zone, target, sudo_password))
+        self.operation_trace.append("set_default_zone")
+        if self.next_set_default_zone_error is not None:
+            error = self.next_set_default_zone_error
+            self.next_set_default_zone_error = None
+            raise error
+        return self.next_set_default_zone_result
 
 
 class ServiceFactory:
