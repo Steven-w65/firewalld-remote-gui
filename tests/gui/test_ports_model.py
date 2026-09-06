@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
-from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QModelIndex, QRect, QSortFilterProxyModel, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtTest import QSignalSpy
+from PySide6.QtWidgets import QProxyStyle, QStyle
 
 from app.controllers.session import ServerSessionView
 from app.gui.models.ports_model import (
@@ -162,13 +164,46 @@ def test_model_exposes_required_columns_safe_empty_roles_and_accessible_booleans
     ] == ["Port", "Protocol", "Zone", "Runtime", "Permanent"]
     assert model.data(QModelIndex(), Qt.ItemDataRole.DisplayRole) is None
     assert model.data(model.index(0, 0), Qt.ItemDataRole.UserRole) is None
-    assert model.data(model.index(0, 3), Qt.ItemDataRole.DisplayRole) == "✓"
-    assert model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole) == ""
+    assert model.data(model.index(0, 3), Qt.ItemDataRole.DisplayRole) is None
+    assert model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole) is None
     assert model.data(model.index(0, 3), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
     assert model.data(model.index(0, 4), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked
     assert model.data(model.index(0, 3), Qt.ItemDataRole.AccessibleTextRole) == "Runtime: Yes"
     assert model.data(model.index(0, 4), Qt.ItemDataRole.AccessibleTextRole) == "Permanent: No"
     assert not (model.flags(model.index(0, 3)) & Qt.ItemFlag.ItemIsUserCheckable)
+
+
+def test_ports_tab_centers_the_only_status_indicator_in_boolean_columns(qtbot):
+    class RecordingStyle(QProxyStyle):
+        def __init__(self):
+            super().__init__()
+            self.checkbox_rects: list[QRect] = []
+
+        def drawPrimitive(self, element, option, painter, widget=None):
+            if element is QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck:
+                self.checkbox_rects.append(QRect(option.rect))
+            super().drawPrimitive(element, option, painter, widget)
+
+    tab = PortsTab()
+    qtbot.addWidget(tab)
+    tab.resize(900, 400)
+    tab.set_session(_view())
+    recording_style = RecordingStyle()
+    recording_style.setParent(tab)
+    tab.table.setStyle(recording_style)
+    tab.show()
+
+    recording_style.checkbox_rects.clear()
+    pixmap = QPixmap(tab.table.viewport().size())
+    tab.table.viewport().render(pixmap)
+
+    for column in (3, 4):
+        cell_rect = tab.table.visualRect(tab.proxy_model.index(0, column))
+        indicators = [
+            rect for rect in recording_style.checkbox_rects if cell_rect.contains(rect.center())
+        ]
+        assert len(indicators) == 1
+        assert indicators[0].center() == cell_rect.center()
 
 
 def test_set_rows_resets_model_and_sort_uses_numeric_port_bounds(qtbot):
