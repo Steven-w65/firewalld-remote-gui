@@ -20,7 +20,7 @@ from app.utils.errors import (
     PostMutationVerificationError,
     SudoAuthenticationRequiredError,
 )
-from app.utils.logging_setup import ServerLogBuffer
+from app.utils.logging_setup import ServerLogBuffer, configure_logging
 from app.workers.scheduler import OperationScheduler
 from tests.controllers.fakes import (
     FakeConfigManager,
@@ -661,6 +661,95 @@ def test_controller_events_append_fixed_sanitized_operation_metadata(qapp) -> No
     assert "duration=" in text
     assert "secret" not in text
     assert server.log_entries("db01") == ()
+
+
+def test_controller_operation_records_are_identical_in_memory_and_rotating_file(
+    qapp, tmp_path
+) -> None:
+    """Catches operational records stopping at the Logs-tab memory buffer."""
+    del qapp
+    logger = configure_logging(tmp_path / "logs", ("ssh-web01-secret",))
+    buffer = ServerLogBuffer(secrets=("ssh-web01-secret",))
+    scheduler = ManualScheduler()
+    server = ServerController(
+        FakeConfigManager(make_loaded("web01")),
+        scheduler,
+        ManagerFactory(),
+        ServiceFactory(),
+        log_buffer=buffer,
+        operation_logger=logger,
+    )
+
+    try:
+        server.connect("web01")
+        scheduler.pending("web01", "connect").run_synchronously_for_test()
+        for handler in logger.handlers:
+            handler.flush()
+
+        memory_lines = server.log_entries("web01")
+        file_lines = (
+            tmp_path / "logs" / "remote-firewalld-manager.log"
+        ).read_text(encoding="utf-8").splitlines()
+        memory_payloads = tuple(line.split(": ", 1)[1] for line in memory_lines)
+        file_payloads = tuple(line.split(": ", 1)[1] for line in file_lines)
+
+        assert len(memory_payloads) == len(file_payloads) == 2
+        assert memory_payloads == file_payloads
+        assert sum("outcome=started" in line for line in file_lines) == 1
+        assert sum("outcome=succeeded" in line for line in file_lines) == 1
+        for line in file_lines:
+            assert " INFO " in line
+            assert "server=web01" in line
+            assert "operation=connect" in line
+            assert "target=none" in line
+            assert "duration=" in line
+            assert "outcome=" in line
+            assert "ssh-web01-secret" not in line
+    finally:
+        for handler in logger.handlers[:]:
+            if getattr(handler, "_remote_firewalld_logging_handler", False):
+                logger.removeHandler(handler)
+                handler.close()
+
+
+def test_configuration_reload_registers_new_ssh_password_with_file_redactor(
+    qapp, tmp_path
+) -> None:
+    """Catches reloaded SSH secrets being known only to the in-memory sink."""
+    del qapp
+    initial = make_loaded("web01")
+    config = FakeConfigManager(initial)
+    logger = configure_logging(tmp_path / "logs", (initial.servers[0].password,))
+    server = ServerController(
+        config,
+        ManualScheduler(),
+        ManagerFactory(),
+        ServiceFactory(),
+        operation_logger=logger,
+    )
+    new_secret = "new-file-redaction-secret"
+
+    try:
+        config.current = replace(
+            initial,
+            servers=(replace(initial.servers[0], password=new_secret),),
+        )
+        server.reload_configuration()
+        logger.info("credential probe %s", new_secret)
+        for handler in logger.handlers:
+            handler.flush()
+
+        text = (
+            tmp_path / "logs" / "remote-firewalld-manager.log"
+        ).read_text(encoding="utf-8")
+        assert "credential probe" in text
+        assert new_secret not in text
+        assert "[REDACTED]" in text
+    finally:
+        for handler in logger.handlers[:]:
+            if getattr(handler, "_remote_firewalld_logging_handler", False):
+                logger.removeHandler(handler)
+                handler.close()
 
 
 @pytest.mark.parametrize(

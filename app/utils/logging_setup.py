@@ -42,13 +42,23 @@ class SecretRedactionFilter(logging.Filter):
     def __init__(self, secrets: Iterable[str]):
         super().__init__()
         self._credential_safe_redactor = True
-        self._secrets = tuple(
-            sorted(
-                {secret for secret in secrets if isinstance(secret, str) and secret.strip()},
-                key=len,
-                reverse=True,
+        self._lock = RLock()
+        self._secrets: tuple[str, ...] = ()
+        self.add_secrets(secrets)
+
+    def add_secrets(self, secrets: Iterable[str]) -> None:
+        """Register additional redaction values without exposing existing ones."""
+        additions = {
+            secret
+            for secret in secrets
+            if isinstance(secret, str) and secret.strip()
+        }
+        if not additions:
+            return
+        with self._lock:
+            self._secrets = tuple(
+                sorted(set(self._secrets).union(additions), key=len, reverse=True)
             )
-        )
 
     def filter(self, record: logging.LogRecord) -> bool:
         sanitized = copy.copy(record)
@@ -162,7 +172,9 @@ class SecretRedactionFilter(logging.Filter):
 
     def _redact_text(self, text: str) -> str:
         redacted = text
-        for secret in self._secrets:
+        with self._lock:
+            secrets = self._secrets
+        for secret in secrets:
             redacted = redacted.replace(secret, "[REDACTED]")
         return _SENSITIVE_VALUE_PATTERN.sub(r"\g<key>\g<separator>[REDACTED]", redacted)
 
@@ -216,6 +228,38 @@ def configure_logging(log_dir: Path, secrets: Iterable[str]) -> logging.Logger:
     for handler in logger.handlers:
         _replace_redactor(handler, redaction_filter)
     return logger
+
+
+def register_logging_secrets(
+    logger: logging.Logger,
+    secrets: Iterable[str],
+) -> None:
+    """Add redaction values to every configured application-log boundary."""
+    additions = tuple(
+        secret
+        for secret in secrets
+        if isinstance(secret, str) and secret.strip()
+    )
+    if not additions:
+        return
+
+    redactors: list[SecretRedactionFilter] = []
+    seen: set[int] = set()
+    for filterer in (logger, *logger.handlers):
+        for candidate in filterer.filters:
+            if isinstance(candidate, SecretRedactionFilter) and id(candidate) not in seen:
+                seen.add(id(candidate))
+                redactors.append(candidate)
+
+    if not redactors:
+        redactor = SecretRedactionFilter(additions)
+        _replace_redactor(logger, redactor)
+        for handler in logger.handlers:
+            _replace_redactor(handler, redactor)
+        return
+
+    for redactor in redactors:
+        redactor.add_secrets(additions)
 
 
 class ServerLogBuffer(QObject):

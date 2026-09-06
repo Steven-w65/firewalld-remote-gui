@@ -116,7 +116,7 @@ def build_application(
     scheduler: OperationScheduler | None = None
     controller: ServerController | None = None
     try:
-        configure_logging(
+        operation_logger = configure_logging(
             paths.log_dir,
             (server.password for server in loaded.servers),
         )
@@ -140,6 +140,7 @@ def build_application(
             scheduler,
             manager_factory,
             host_key_store=host_key_store,
+            operation_logger=operation_logger,
         )
         firewall_controller = FirewallController(controller)
         window = MainWindow(controller, firewall_controller)

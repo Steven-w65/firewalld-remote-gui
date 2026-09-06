@@ -141,11 +141,13 @@ def test_successful_bootstrap_builds_graph_without_creating_ssh_client(
             manager_factory,
             *,
             host_key_store,
+            operation_logger,
         ):
             calls["controller"] = self
             calls["scheduler"] = scheduler
             calls["manager_factory"] = manager_factory
             calls["controller_host_keys"] = host_key_store
+            calls["controller_operation_logger"] = operation_logger
             self.loaded = config_manager.load()
             self.shutdown_calls = []
 
@@ -164,11 +166,13 @@ def test_successful_bootstrap_builds_graph_without_creating_ssh_client(
             return calls["controller"].shutdown(timeout_ms=5000)
 
     monkeypatch.setattr(main, "ConfigManager", FakeConfigManager)
+    operation_logger = object()
     monkeypatch.setattr(
         main,
         "configure_logging",
-        lambda directory, secrets: calls.update(
-            log_dir=directory, logging_secrets=tuple(secrets)
+        lambda directory, secrets: (
+            calls.update(log_dir=directory, logging_secrets=tuple(secrets))
+            or operation_logger
         ),
     )
     monkeypatch.setattr(
@@ -196,6 +200,7 @@ def test_successful_bootstrap_builds_graph_without_creating_ssh_client(
     assert calls["log_dir"] == paths.log_dir
     assert calls["logging_secrets"] == (password,)
     assert calls["host_key_path"] == paths.known_hosts_file
+    assert calls["controller_operation_logger"] is operation_logger
     assert calls["loads"] == 1
     assert calls["window_controller"] is calls["controller"]
     assert calls["window_firewall_controller"] is calls["firewall_controller"]

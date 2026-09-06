@@ -76,12 +76,14 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
             manager_factory,
             *,
             host_key_store,
+            operation_logger,
         ):
             calls["controller"] = (
                 config_manager,
                 scheduler,
                 manager_factory,
                 host_key_store,
+                operation_logger,
             )
             self.loaded = config_manager.load()
 
@@ -105,11 +107,13 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
         main.PortablePaths, "from_entrypoint", lambda path: paths
     )
     monkeypatch.setattr(main, "ConfigManager", FakeConfigManager)
+    operation_logger = object()
     monkeypatch.setattr(
         main,
         "configure_logging",
-        lambda directory, secrets: calls.update(
-            log_dir=directory, logging_secrets=tuple(secrets)
+        lambda directory, secrets: (
+            calls.update(log_dir=directory, logging_secrets=tuple(secrets))
+            or operation_logger
         ),
     )
     monkeypatch.setattr(
@@ -140,8 +144,15 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
     assert window.show_calls == 1
     assert window.shutdown_calls == 1
     server = controller.loaded.servers[0]
-    _, _, manager_factory, controller_host_keys = calls["controller"]
+    (
+        _,
+        _,
+        manager_factory,
+        controller_host_keys,
+        controller_operation_logger,
+    ) = calls["controller"]
     assert controller_host_keys == known_hosts_file
+    assert controller_operation_logger is operation_logger
     monkeypatch.setattr(
         main,
         "SSHManager",

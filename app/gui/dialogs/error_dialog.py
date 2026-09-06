@@ -100,14 +100,14 @@ _CATEGORY_PRESENTATIONS = {
         "error",
     ),
     "post_mutation_verification": _ErrorPresentation(
-        "Reload Verification Incomplete",
-        "Firewalld reloaded, but its running state could not be verified. "
+        "Firewall Change Verification Incomplete",
+        "The firewall change completed, but its requested state could not be verified. "
         "Refresh or reconnect before making more changes.",
         "warning",
     ),
     "post_mutation_refresh": _ErrorPresentation(
-        "Reload Completed; Refresh Failed",
-        "Firewalld reloaded, but fresh firewall data could not be loaded. "
+        "Firewall Change Completed; Refresh Failed",
+        "The firewall change completed, but fresh firewall data could not be loaded. "
         "Existing firewall data is stale.",
         "warning",
     ),
@@ -128,18 +128,63 @@ _CATEGORY_PRESENTATIONS = {
     ),
 }
 
-_PORT_POST_MUTATION_PRESENTATIONS = {
-    "post_mutation_verification": _ErrorPresentation(
-        "Port Change Verification Incomplete",
-        "The port command completed, but the requested firewall state could not "
-        "be verified. Refresh or reconnect before making more changes.",
-        "warning",
+def _post_mutation_presentations(
+    title: str,
+    subject: str,
+    verification_detail: str = "the requested firewall state",
+) -> dict[str, _ErrorPresentation]:
+    return {
+        "post_mutation_verification": _ErrorPresentation(
+            f"{title} Verification Incomplete",
+            f"{subject} completed, but {verification_detail} could not be verified. "
+            "Refresh or reconnect before making more changes.",
+            "warning",
+        ),
+        "post_mutation_refresh": _ErrorPresentation(
+            f"{title} Completed; Refresh Failed",
+            f"{subject} completed, but fresh firewall data could not be loaded. "
+            "Existing firewall data is stale.",
+            "warning",
+        ),
+    }
+
+
+_POST_MUTATION_PRESENTATIONS = {
+    "reload_firewalld": {
+        "post_mutation_verification": _ErrorPresentation(
+            "Reload Verification Incomplete",
+            "Firewalld reloaded, but its running state could not be verified. "
+            "Refresh or reconnect before making more changes.",
+            "warning",
+        ),
+        "post_mutation_refresh": _ErrorPresentation(
+            "Reload Completed; Refresh Failed",
+            "Firewalld reloaded, but fresh firewall data could not be loaded. "
+            "Existing firewall data is stale.",
+            "warning",
+        ),
+    },
+    "set_default_zone": _post_mutation_presentations(
+        "Default Zone Change",
+        "The default-zone change",
+        "the requested default zone",
     ),
-    "post_mutation_refresh": _ErrorPresentation(
-        "Port Change Completed; Refresh Failed",
-        "The port change completed, but fresh firewall data could not be loaded. "
-        "Existing firewall data is stale.",
-        "warning",
+    "add_port": _post_mutation_presentations("Port Change", "The port change"),
+    "remove_port": _post_mutation_presentations("Port Change", "The port change"),
+    "add_service": _post_mutation_presentations(
+        "Service Change", "The service change"
+    ),
+    "remove_service": _post_mutation_presentations(
+        "Service Change", "The service change"
+    ),
+    "change_interface_zone": _post_mutation_presentations(
+        "Interface Zone Change", "The interface-zone change"
+    ),
+    "add_rich_rule": _post_mutation_presentations(
+        "Rich Rule Change", "The rich-rule change"
+    ),
+    "remove_rich_rule": _post_mutation_presentations(
+        "Rich Rule Change", "The rich-rule change"
     ),
 }
 
@@ -174,17 +219,14 @@ class ErrorDialog(QDialog):
         cls, error: object, parent: QWidget | None = None
     ) -> ErrorDialog:
         if isinstance(error, ControllerOperationError):
-            if error.operation in {"add_port", "remove_port"}:
-                presentation = _PORT_POST_MUTATION_PRESENTATIONS.get(
-                    error.category,
-                    _CATEGORY_PRESENTATIONS.get(
-                        error.category, _CATEGORY_PRESENTATIONS["operation"]
-                    ),
-                )
-            else:
-                presentation = _CATEGORY_PRESENTATIONS.get(
+            presentation = _POST_MUTATION_PRESENTATIONS.get(
+                error.operation, {}
+            ).get(
+                error.category,
+                _CATEGORY_PRESENTATIONS.get(
                     error.category, _CATEGORY_PRESENTATIONS["operation"]
-                )
+                ),
+            )
         elif isinstance(error, ChangedHostKeyError):
             presentation = _CATEGORY_PRESENTATIONS["host_key_changed"]
         elif isinstance(error, UnknownHostKeyError):

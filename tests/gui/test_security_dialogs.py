@@ -278,6 +278,64 @@ def test_port_post_mutation_refresh_error_uses_operation_specific_safe_copy(qtbo
     assert "unsafe-secret" not in visible
 
 
+@pytest.mark.parametrize(
+    ("operation", "resource_title", "resource_message"),
+    (
+        ("reload_firewalld", "Reload", "Firewalld reloaded"),
+        ("set_default_zone", "Default Zone Change", "default-zone change"),
+        ("add_port", "Port Change", "port change"),
+        ("remove_port", "Port Change", "port change"),
+        ("add_service", "Service Change", "service change"),
+        ("remove_service", "Service Change", "service change"),
+        ("change_interface_zone", "Interface Zone Change", "interface-zone change"),
+        ("add_rich_rule", "Rich Rule Change", "rich-rule change"),
+        ("remove_rich_rule", "Rich Rule Change", "rich-rule change"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("category", "title_suffix", "message_fragment"),
+    (
+        (
+            "post_mutation_verification",
+            "Verification Incomplete",
+            "could not be verified",
+        ),
+        (
+            "post_mutation_refresh",
+            "Completed; Refresh Failed",
+            "fresh firewall data could not be loaded",
+        ),
+    ),
+)
+def test_post_mutation_errors_use_fixed_operation_specific_copy(
+    qtbot,
+    operation,
+    resource_title,
+    resource_message,
+    category,
+    title_suffix,
+    message_fragment,
+):
+    """Catches resource changes being falsely presented as firewalld reloads."""
+    dialog = ErrorDialog.from_domain_error(
+        ControllerOperationError(
+            "web01",
+            operation,
+            category,
+            "unsafe-secret raw backend detail",
+        )
+    )
+    qtbot.addWidget(dialog)
+
+    visible = _widget_text(dialog)
+    assert dialog.windowTitle() == f"{resource_title} {title_suffix}"
+    assert resource_message.casefold() in visible.casefold()
+    assert message_fragment in visible.casefold()
+    assert "unsafe-secret" not in visible
+    if operation != "reload_firewalld":
+        assert "reload" not in visible.casefold()
+
+
 def test_dialogs_never_call_backend_objects(qtbot, challenge, risky_preview):
     for dialog in (
         HostKeyDialog(challenge),

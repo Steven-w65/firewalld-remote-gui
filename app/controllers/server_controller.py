@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Event, Lock
@@ -43,7 +44,7 @@ from app.utils.validation import (
     validate_port,
     validate_protocol,
 )
-from app.utils.logging_setup import ServerLogBuffer
+from app.utils.logging_setup import ServerLogBuffer, register_logging_secrets
 from app.workers.scheduler import JobHandle
 
 
@@ -442,6 +443,7 @@ class ServerController(QObject):
         *,
         host_key_store: _HostKeyStore | None = None,
         log_buffer: ServerLogBuffer | None = None,
+        operation_logger: logging.Logger | None = None,
     ) -> None:
         super().__init__()
         self._config_manager = config_manager
@@ -449,6 +451,7 @@ class ServerController(QObject):
         self._manager_factory = manager_factory
         self._service_factory = service_factory
         self._host_key_store = host_key_store
+        self._operation_logger = operation_logger
         self._loaded = config_manager.load()
         self._log_buffer = log_buffer or ServerLogBuffer(
             secrets=(server.password for server in self._loaded.servers)
@@ -456,6 +459,11 @@ class ServerController(QObject):
         self._log_buffer.add_secrets(
             server.password for server in self._loaded.servers
         )
+        if self._operation_logger is not None:
+            register_logging_secrets(
+                self._operation_logger,
+                (server.password for server in self._loaded.servers),
+            )
         self._log_buffer.entries_changed.connect(self._log_buffer_changed)
         self._sessions: dict[str, ServerSession] = {
             config.id: ServerSession(config=config)
@@ -943,6 +951,11 @@ class ServerController(QObject):
         self._log_buffer.add_secrets(
             server.password for server in loaded.servers
         )
+        if self._operation_logger is not None:
+            register_logging_secrets(
+                self._operation_logger,
+                (server.password for server in loaded.servers),
+            )
         old_sessions = self._sessions
         for server_id in (*diff.changed, *diff.removed):
             self._log_buffer.clear(server_id)
@@ -1823,13 +1836,16 @@ class ServerController(QObject):
             else "none"
         )
         duration = 0.0 if started_at is None else max(0.0, monotonic() - started_at)
+        message = (
+            f"server={server_id} operation={operation} target={target} "
+            f"duration={duration:.3f}s outcome={outcome}"
+        )
         self._log_buffer.append_message(
             server_id,
-            (
-                f"server={server_id} operation={operation} target={target} "
-                f"duration={duration:.3f}s outcome={outcome}"
-            ),
+            message,
         )
+        if self._operation_logger is not None:
+            self._operation_logger.info(message, extra={"server_id": server_id})
 
     @staticmethod
     def _firewall_result_outcome(result: CompositeOperationResult) -> str:
