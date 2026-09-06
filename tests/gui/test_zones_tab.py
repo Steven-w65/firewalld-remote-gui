@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QDialog, QProxyStyle, QStyle
 
 from app.controllers.firewall_controller import FirewallController
 from app.controllers.server_controller import ServerController
@@ -100,6 +101,57 @@ def test_zones_model_is_read_only_and_exposes_exact_zone_values(qtbot) -> None:
         sorted(_snapshot().runtime_zones, key=lambda zone: zone.name)
     )
     assert isinstance(model.row_at(0), ZoneRow)
+    assert model.data(model.index(0, 1), Qt.ItemDataRole.DisplayRole) is None
+    assert model.data(model.index(1, 1), Qt.ItemDataRole.DisplayRole) is None
+    assert (
+        model.data(model.index(0, 1), Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Unchecked
+    )
+    assert (
+        model.data(model.index(1, 1), Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Checked
+    )
+    assert not (model.flags(model.index(1, 1)) & Qt.ItemFlag.ItemIsUserCheckable)
+
+
+def test_zones_tab_centers_and_paints_active_status_indicators(qtbot) -> None:
+    class RecordingStyle(QProxyStyle):
+        def __init__(self):
+            super().__init__()
+            self.checkbox_options: list[tuple[QRect, QStyle.StateFlag]] = []
+
+        def drawPrimitive(self, element, option, painter, widget=None):
+            if element is QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck:
+                self.checkbox_options.append((QRect(option.rect), option.state))
+            super().drawPrimitive(element, option, painter, widget)
+
+    tab = ZonesTab()
+    qtbot.addWidget(tab)
+    tab.resize(900, 500)
+    tab.set_snapshot(_snapshot())
+    recording_style = RecordingStyle()
+    recording_style.setParent(tab)
+    tab.table.setStyle(recording_style)
+    tab.show()
+
+    recording_style.checkbox_options.clear()
+    pixmap = QPixmap(tab.table.viewport().size())
+    tab.table.viewport().render(pixmap)
+
+    for row, expected_state in (
+        (0, QStyle.StateFlag.State_Off),
+        (1, QStyle.StateFlag.State_On),
+    ):
+        cell_rect = tab.table.visualRect(tab.model.index(row, 1))
+        indicators = [
+            (rect, state)
+            for rect, state in recording_style.checkbox_options
+            if cell_rect.contains(rect.center())
+        ]
+        assert len(indicators) == 1
+        indicator_rect, indicator_state = indicators[0]
+        assert indicator_rect.center() == cell_rect.center()
+        assert indicator_state & expected_state
 
 
 def test_zone_tab_switches_runtime_and_permanent_without_mixing(qtbot) -> None:

@@ -107,7 +107,7 @@ class ZonesModel(QAbstractTableModel):
                 return row.name
             return None
         if role == Qt.ItemDataRole.DisplayRole:
-            return "✓" if row.active else ""
+            return None
         if role == Qt.ItemDataRole.CheckStateRole:
             return Qt.CheckState.Checked if row.active else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.AccessibleTextRole:

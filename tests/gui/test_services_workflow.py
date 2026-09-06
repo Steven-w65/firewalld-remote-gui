@@ -4,8 +4,9 @@ from dataclasses import FrozenInstanceError, replace
 from threading import Event
 
 import pytest
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QDialog
+from PySide6.QtCore import QRect, Qt, QTimer
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QDialog, QProxyStyle, QStyle
 
 from app.controllers.firewall_controller import FirewallController
 from app.controllers.server_controller import ControllerOperationError, ServerController
@@ -99,6 +100,50 @@ def workflow(qtbot):
     return window, server, firewall, scheduler, services.instances["web01"][0]
 
 
+def test_services_tab_centers_and_paints_status_indicators(workflow):
+    class RecordingStyle(QProxyStyle):
+        def __init__(self):
+            super().__init__()
+            self.checkbox_options: list[tuple[QRect, QStyle.StateFlag]] = []
+
+        def drawPrimitive(self, element, option, painter, widget=None):
+            if element is QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck:
+                self.checkbox_options.append((QRect(option.rect), option.state))
+            super().drawPrimitive(element, option, painter, widget)
+
+    window, *_ = workflow
+    tab = window.services_tab
+    tab.resize(900, 400)
+    recording_style = RecordingStyle()
+    recording_style.setParent(tab)
+    tab.table.setStyle(recording_style)
+    tab.show()
+
+    recording_style.checkbox_options.clear()
+    pixmap = QPixmap(tab.table.viewport().size())
+    tab.table.viewport().render(pixmap)
+
+    http_row = next(
+        row
+        for row in range(tab.proxy_model.rowCount())
+        if tab.proxy_model.data(tab.proxy_model.index(row, 0)) == "http"
+    )
+    for column, expected_state in (
+        (2, QStyle.StateFlag.State_On),
+        (3, QStyle.StateFlag.State_Off),
+    ):
+        cell_rect = tab.table.visualRect(tab.proxy_model.index(http_row, column))
+        indicators = [
+            (rect, state)
+            for rect, state in recording_style.checkbox_options
+            if cell_rect.contains(rect.center())
+        ]
+        assert len(indicators) == 1
+        indicator_rect, indicator_state = indicators[0]
+        assert indicator_rect.center() == cell_rect.center()
+        assert indicator_state & expected_state
+
+
 def _rows(window: MainWindow) -> tuple[ServiceRow, ...]:
     return tuple(
         row
@@ -172,6 +217,30 @@ def test_services_model_search_and_presence_filter_real_rows(qapp) -> None:
     proxy.set_presence_filter(ServicePresenceFilter.BOTH)
     assert proxy.rowCount() == 1
     assert proxy.service_row(proxy.index(0, 0)).name == "ssh"
+
+
+def test_services_model_exposes_only_read_only_checkbox_status(qapp) -> None:
+    del qapp
+    model = ServicesTableModel(merge_service_rows(_snapshot(), "public"))
+    http_row = next(
+        row
+        for row in range(model.rowCount())
+        if model.data(model.index(row, 0)) == "http"
+    )
+
+    assert model.data(model.index(http_row, 2), Qt.ItemDataRole.DisplayRole) is None
+    assert model.data(model.index(http_row, 3), Qt.ItemDataRole.DisplayRole) is None
+    assert (
+        model.data(model.index(http_row, 2), Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Checked
+    )
+    assert (
+        model.data(model.index(http_row, 3), Qt.ItemDataRole.CheckStateRole)
+        == Qt.CheckState.Unchecked
+    )
+    assert not (
+        model.flags(model.index(http_row, 2)) & Qt.ItemFlag.ItemIsUserCheckable
+    )
 
 
 def test_add_service_dialog_lists_remote_inventory_only_and_filters_by_target(qtbot) -> None:

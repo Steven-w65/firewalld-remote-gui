@@ -116,7 +116,7 @@ class ServicesTableModel(QAbstractTableModel):
             return None
         present = row.runtime if column == 2 else row.permanent
         if role == Qt.ItemDataRole.DisplayRole:
-            return "✓" if present else ""
+            return None
         if role == Qt.ItemDataRole.CheckStateRole:
             return Qt.CheckState.Checked if present else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.AccessibleTextRole:

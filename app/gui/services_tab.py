@@ -23,6 +23,7 @@ from app.gui.models.services_model import (
     merge_service_rows,
 )
 from app.gui.server_sidebar import status_presentation
+from app.gui.widgets.checkbox_delegate import CenteredCheckBoxDelegate
 from app.models.command import CompositeOperationResult
 from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
@@ -72,6 +73,9 @@ class ServicesTab(QWidget):
         self.table = QTableView()
         self.table.setAccessibleName("Firewall services table")
         self.table.setModel(self.proxy_model)
+        self._presence_delegate = CenteredCheckBoxDelegate(self.table)
+        self.table.setItemDelegateForColumn(2, self._presence_delegate)
+        self.table.setItemDelegateForColumn(3, self._presence_delegate)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)

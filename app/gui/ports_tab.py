@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, Qt, Signal
-from PySide6.QtGui import QPainter
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QStyle,
-    QStyledItemDelegate,
-    QStyleOptionViewItem,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -28,52 +23,12 @@ from app.gui.models.ports_model import (
     merge_port_rows,
 )
 from app.gui.server_sidebar import status_presentation
+from app.gui.widgets.checkbox_delegate import CenteredCheckBoxDelegate
 from app.models.command import CompositeOperationResult
 from app.models.enums import ApplyTarget, ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
 from app.models.port import PortRow
 from app.utils.validation import validate_inventory_token
-
-
-class _CenteredCheckBoxDelegate(QStyledItemDelegate):
-    """Paint a read-only item-view checkbox in the center of its cell."""
-
-    def paint(self, painter: QPainter, option, index) -> None:
-        view_option = QStyleOptionViewItem(option)
-        self.initStyleOption(view_option, index)
-        widget = option.widget
-        style = widget.style() if widget is not None else QApplication.style()
-
-        background_option = QStyleOptionViewItem(view_option)
-        background_option.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
-        background_option.text = ""
-        style.drawControl(
-            QStyle.ControlElement.CE_ItemViewItem,
-            background_option,
-            painter,
-            widget,
-        )
-
-        indicator = style.subElementRect(
-            QStyle.SubElement.SE_ItemViewItemCheckIndicator,
-            view_option,
-            widget,
-        )
-        centered = QRect(0, 0, indicator.width(), indicator.height())
-        centered.moveCenter(option.rect.center())
-        checkbox_option = QStyleOptionViewItem(view_option)
-        checkbox_option.rect = centered
-        checkbox_option.state |= (
-            QStyle.StateFlag.State_On
-            if view_option.checkState == Qt.CheckState.Checked
-            else QStyle.StateFlag.State_Off
-        )
-        style.drawPrimitive(
-            QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck,
-            checkbox_option,
-            painter,
-            widget,
-        )
 
 
 class PortsTab(QWidget):
@@ -118,7 +73,7 @@ class PortsTab(QWidget):
         self.table = QTableView()
         self.table.setAccessibleName("Firewall ports table")
         self.table.setModel(self.proxy_model)
-        self._presence_delegate = _CenteredCheckBoxDelegate(self.table)
+        self._presence_delegate = CenteredCheckBoxDelegate(self.table)
         self.table.setItemDelegateForColumn(3, self._presence_delegate)
         self.table.setItemDelegateForColumn(4, self._presence_delegate)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from app.controllers.session import ServerSessionView
 from app.gui.models.zones_model import ZoneRow, ZonesModel
 from app.gui.server_sidebar import status_presentation
+from app.gui.widgets.checkbox_delegate import CenteredCheckBoxDelegate
 from app.models.command import CompositeOperationResult
 from app.models.enums import ConnectionStatus, TargetStatus
 from app.models.firewall import FirewallSnapshot
@@ -57,6 +58,8 @@ class ZonesTab(QWidget):
         self.table = QTableView()
         self.table.setAccessibleName("Firewall zones table")
         self.table.setModel(self.model)
+        self._active_delegate = CenteredCheckBoxDelegate(self.table)
+        self.table.setItemDelegateForColumn(1, self._active_delegate)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
