@@ -119,9 +119,15 @@ def parse_active_zones(output: str) -> dict[str, tuple[str, ...]]:
             if field == "interfaces":
                 zones[active_zone] = parse_words(value)
             continue
-        if ":" in line or line.strip() != line or line in zones:
+        zone_name = line.removesuffix(" (default)")
+        if (
+            ":" in line
+            or line.strip() != line
+            or not zone_name
+            or zone_name in zones
+        ):
             _fail("active zones", "invalid zone name")
-        active_zone = line
+        active_zone = zone_name
         zones[active_zone] = ()
     return zones
 

@@ -33,7 +33,7 @@ def _active_zone_names(snapshot: FirewallSnapshot) -> frozenset[str]:
     return frozenset(
         zone.name
         for zone in snapshot.runtime_zones
-        if zone.interfaces or zone.sources
+        if zone.active
     )
 
 
@@ -136,7 +136,7 @@ class ZonesModel(QAbstractTableModel):
             frozenset(active_zone_names)
             if active_zone_names is not None
             else frozenset(
-                zone.name for zone in values if zone.interfaces or zone.sources
+                zone.name for zone in values if zone.active
             )
         )
         self.beginResetModel()

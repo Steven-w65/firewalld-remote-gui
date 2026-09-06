@@ -501,8 +501,10 @@ class FirewalldService:
                 result = self._execute(spec, sudo_password)
                 zone = parse_zone_state(name, result.stdout, permanent)
                 active_interfaces = active_zones.get(name, ())
-                if not permanent and active_interfaces:
-                    zone = replace(zone, interfaces=active_interfaces)
+                if not permanent and name in active_zones:
+                    zone = replace(zone, active=True)
+                    if active_interfaces:
+                        zone = replace(zone, interfaces=active_interfaces)
                 zones.append(zone)
             except _TERMINAL_FIREWALL_ERRORS:
                 raise

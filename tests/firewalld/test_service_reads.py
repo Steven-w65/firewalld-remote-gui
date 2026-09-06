@@ -381,6 +381,45 @@ def test_snapshot_loads_global_metadata_active_interfaces_and_both_zone_targets(
     scripted_executor.assert_exhausted()
 
 
+def test_snapshot_preserves_all_legacy_active_zones_without_bindings(
+    scripted_executor,
+):
+    scripted_executor.respond("hostname", stdout="web01\n")
+    scripted_executor.respond("distribution", stdout="NAME=Linux\n")
+    scripted_executor.respond("get_state", stdout="running\n")
+    scripted_executor.respond("get_version", stdout="0.9.3\n")
+    scripted_executor.respond("get_default_zone", stdout="public\n")
+    scripted_executor.respond(
+        "list_active_zones", stdout="public (default)\ntrusted\n"
+    )
+    scripted_executor.respond("list_zones_runtime", stdout="public trusted\n")
+    scripted_executor.respond(
+        "get_zone_details_runtime", stdout=zone_output("public")
+    )
+    scripted_executor.respond(
+        "get_zone_details_runtime", stdout=zone_output("trusted")
+    )
+    scripted_executor.respond("list_zones_permanent", stdout="public trusted\n")
+    scripted_executor.respond(
+        "get_zone_details_permanent", stdout=zone_output("public")
+    )
+    scripted_executor.respond(
+        "get_zone_details_permanent", stdout=zone_output("trusted")
+    )
+    scripted_executor.respond("list_available_services", stdout="ssh\n")
+
+    snapshot = FirewalldService(scripted_executor, "web01").load_snapshot()
+
+    assert tuple(zone.name for zone in snapshot.runtime_zones if zone.active) == (
+        "public",
+        "trusted",
+    )
+    assert all(zone.interfaces == () for zone in snapshot.runtime_zones)
+    assert all(zone.sources == () for zone in snapshot.runtime_zones)
+    assert snapshot.stale is False
+    scripted_executor.assert_exhausted()
+
+
 def test_snapshot_keeps_permanent_state_when_one_runtime_zone_detail_fails(scripted_executor):
     scripted_executor.respond("hostname", stdout="web01\n")
     scripted_executor.respond("distribution", stdout="NAME=Fedora\n")

@@ -89,6 +89,27 @@ def test_zone_rows_preserve_runtime_or_permanent_details() -> None:
     assert permanent.forwarding
 
 
+def test_zone_rows_preserve_explicit_activity_without_bindings() -> None:
+    snapshot = FirewallSnapshot(
+        hostname="web01",
+        distribution="Linux",
+        firewalld_running=True,
+        firewalld_version="0.9.3",
+        default_zone="public",
+        runtime_zones=(ZoneState("public", active=True), ZoneState("internal")),
+        permanent_zones=(
+            ZoneState("public", permanent=True),
+            ZoneState("internal", permanent=True),
+        ),
+    )
+
+    runtime = {row.name: row.active for row in zone_rows(snapshot, permanent=False)}
+    permanent = {row.name: row.active for row in zone_rows(snapshot, permanent=True)}
+
+    assert runtime == {"internal": False, "public": True}
+    assert permanent == {"internal": False, "public": True}
+
+
 def test_zones_model_is_read_only_and_exposes_exact_zone_values(qtbot) -> None:
     model = ZonesModel()
     model.set_zones(_snapshot().runtime_zones)

@@ -33,6 +33,10 @@ def test_parse_active_zones_allows_no_active_zone_blocks():
     assert parse_active_zones("\n  \n") == {}
 
 
+def test_parse_active_zones_normalizes_legacy_default_annotation():
+    assert parse_active_zones("public (default)\n") == {"public": ()}
+
+
 def test_parse_active_zones_rejects_an_orphaned_attribute():
     with pytest.raises(FirewallParseError) as error:
         parse_active_zones("  interfaces: eth0\n")

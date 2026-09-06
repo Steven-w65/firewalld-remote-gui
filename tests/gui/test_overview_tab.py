@@ -75,6 +75,24 @@ def test_overview_renders_connected_snapshot_without_inventing_inactive_zones(qt
     assert not tab.snapshot_status_icon.pixmap().isNull()
 
 
+def test_overview_renders_explicit_active_zone_without_bindings(qtbot):
+    tab = OverviewTab()
+    qtbot.addWidget(tab)
+    snapshot = FirewallSnapshot(
+        hostname="web01",
+        distribution="Linux",
+        firewalld_running=True,
+        firewalld_version="0.9.3",
+        default_zone="public",
+        runtime_zones=(ZoneState("public", active=True),),
+    )
+
+    tab.set_session(_view(snapshot=snapshot))
+
+    assert tab.active_zones_value.text() == "public"
+    assert tab.interfaces_value.text() == "None reported"
+
+
 @pytest.mark.parametrize(
     ("view", "firewalld", "hostname"),
     (

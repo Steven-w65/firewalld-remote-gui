@@ -199,7 +199,7 @@ class ZonesTab(QWidget):
             active_names = tuple(
                 zone.name
                 for zone in snapshot.runtime_zones
-                if zone.interfaces or zone.sources
+                if zone.active
             )
         self.table.clearSelection()
         self.model.set_zones(zones, active_zone_names=active_names)

@@ -186,7 +186,7 @@ class OverviewTab(QWidget):
             active = tuple(
                 zone.name
                 for zone in snapshot.runtime_zones
-                if zone.interfaces or zone.sources
+                if zone.active
             )
             interfaces = tuple(
                 f"{interface} ({zone.name})"
