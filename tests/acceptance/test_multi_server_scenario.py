@@ -8,8 +8,32 @@ def test_three_server_port_lifecycle_remains_isolated(qtbot, application_harness
     del qtbot
     app = application_harness.with_servers("web01", "db01", "test01")
     assert app.server_ids() == ("web01", "db01", "test01")
-    app.connect("web01")
-    app.add_port("web01", "public", "8080", "tcp", ApplyTarget.BOTH)
+
+    cycles = (
+        ("web01", "8080", "tcp", ApplyTarget.BOTH, True, True),
+        ("db01", "5432", "tcp", ApplyTarget.RUNTIME, True, False),
+        ("test01", "5353", "udp", ApplyTarget.PERMANENT, False, True),
+    )
+    for server_id, port, protocol, target, runtime, permanent in cycles:
+        app.select(server_id)
+        assert app.selected_server_id() == server_id
+        app.connect(server_id)
+        app.add_port(server_id, "public", port, protocol, target)
+        app.refresh(server_id)
+        row = app.port_row(server_id, port, protocol)
+        assert row is not None
+        assert (row.runtime, row.permanent) == (runtime, permanent)
+
+    for owner, port, protocol, _target, _runtime, _permanent in cycles:
+        for selected, *_rest in cycles:
+            app.select(selected)
+            assert app.selected_server_id() == selected
+            assert (app.port_row(selected, port, protocol) is not None) is (
+                selected == owner
+            )
+
+    app.select("web01")
+    app.add_port("web01", "public", "8443", "tcp", ApplyTarget.BOTH)
     add_evidence = app.last_operation_evidence()
     assert add_evidence is not None
     assert (
@@ -17,15 +41,10 @@ def test_three_server_port_lifecycle_remains_isolated(qtbot, application_harness
         add_evidence.snapshot_refreshes,
         add_evidence.confirmations,
     ) == (1, 1, 1)
-    assert app.port_row("web01", "8080", "tcp").runtime
-    assert app.port_row("web01", "8080", "tcp").permanent
+    assert app.port_row("web01", "8443", "tcp").runtime
+    assert app.port_row("web01", "8443", "tcp").permanent
 
-    app.connect("db01")
-    assert app.port_row("db01", "8080", "tcp") is None
-    app.select("web01")
-    assert app.port_row("web01", "8080", "tcp") is not None
-
-    app.remove_port("web01", "public", "8080", "tcp", ApplyTarget.BOTH)
+    app.remove_port("web01", "public", "8443", "tcp", ApplyTarget.BOTH)
     remove_evidence = app.last_operation_evidence()
     assert remove_evidence is not None
     assert (
@@ -33,7 +52,7 @@ def test_three_server_port_lifecycle_remains_isolated(qtbot, application_harness
         remove_evidence.snapshot_refreshes,
         remove_evidence.confirmations,
     ) == (1, 1, 1)
-    assert app.port_row("web01", "8080", "tcp") is None
+    assert app.port_row("web01", "8443", "tcp") is None
 
 
 def test_readable_ssh_failure_is_displayed_without_crashing(application_harness):

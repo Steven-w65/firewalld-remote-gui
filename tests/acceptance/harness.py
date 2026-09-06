@@ -25,6 +25,7 @@ from app.gui.dialogs.change_interface_dialog import ChangeInterfaceDialog
 from app.gui.dialogs.confirmation_dialog import ConfirmationDialog
 from app.gui.dialogs.error_dialog import ErrorDialog
 from app.gui.dialogs.rich_rule_dialog import RichRuleDialog
+from app.gui.dialogs.sudo_password_dialog import SudoPasswordDialog
 from app.gui.main_window import MainWindow
 from app.models.command import CommandResult, CompositeOperationResult, TargetResult
 from app.models.enums import ApplyTarget, TargetStatus
@@ -33,7 +34,11 @@ from app.models.interface import InterfaceRow
 from app.models.port import PortRow
 from app.models.rich_rule import RichRuleRow
 from app.models.service import ServiceRow
-from app.utils.errors import SSHAuthenticationError, SudoAuthenticationError
+from app.utils.errors import (
+    SSHAuthenticationError,
+    SudoAuthenticationError,
+    SudoAuthenticationRequiredError,
+)
 from tests.controllers.fakes import (
     FakeConfigManager,
     ManagerFactory,
@@ -50,6 +55,22 @@ class OperationEvidence:
     mutation_calls: int
     snapshot_refreshes: int
     confirmations: int
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialSurfaceEvidence:
+    """Immutable, secret-free capture of every public presentation sink."""
+
+    logs: tuple[str, ...]
+    errors: tuple[str, ...]
+    clipboard: str
+    widgets: tuple[str, ...]
+    models: tuple[str, ...]
+    sessions: tuple[str, ...]
+    public_results: tuple[str, ...]
+    sudo_prompted: bool
+    sudo_reached_fake_service: bool
+    sudo_widget_cleared: bool
 
 
 def _management_rule() -> RichRule:
@@ -172,6 +193,28 @@ def _widget_text(root: QWidget) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _model_text(window: MainWindow) -> tuple[str, ...]:
+    values: list[str] = []
+    for tab in (
+        window.overview_tab,
+        window.ports_tab,
+        window.services_tab,
+        window.zones_tab,
+        window.interfaces_tab,
+        window.rich_rules_tab,
+    ):
+        table = getattr(tab, "table", getattr(tab, "test_results", None))
+        model = None if table is None else table.model()
+        if model is None:
+            continue
+        for row in range(model.rowCount()):
+            for column in range(model.columnCount()):
+                value = model.data(model.index(row, column), Qt.ItemDataRole.DisplayRole)
+                if value:
+                    values.append(str(value))
+    return tuple(values)
+
+
 class ApplicationHarnessFactory:
     def __init__(self, qtbot, monkeypatch) -> None:
         self._qtbot = qtbot
@@ -242,6 +285,7 @@ class ApplicationHarness:
         self._errors: list[tuple[str, ...]] = []
         self._public_results: list[str] = []
         self._evidence: list[OperationEvidence] = []
+        self._sudo_dialogs: list[SudoPasswordDialog] = []
         self._firewall.operation_result.connect(
             lambda _server_id, result: self._public_results.append(repr(result))
         )
@@ -256,6 +300,9 @@ class ApplicationHarness:
     def server_ids(self) -> tuple[str, ...]:
         return self._window.server_sidebar.server_ids()
 
+    def selected_server_id(self) -> str | None:
+        return self._server.selected_server_id
+
     def connect(self, server_id: str) -> None:
         self.select(server_id)
         self._window.server_sidebar.connect_button.click()
@@ -264,6 +311,12 @@ class ApplicationHarness:
     def select(self, server_id: str) -> None:
         self._window.server_sidebar.select_server(server_id)
         QApplication.processEvents()
+
+    def refresh(self, server_id: str) -> None:
+        self.select(server_id)
+        self._service(server_id).next_snapshot = self._snapshots[server_id]
+        self._window.refresh_action.trigger()
+        self._scheduler.pending(server_id, "refresh").run_synchronously_for_test()
 
     def add_port(
         self,
@@ -586,15 +639,15 @@ class ApplicationHarness:
         self._managers.next_errors[server_id] = SSHAuthenticationError(server_id)
         self.connect(server_id)
 
-    def simulate_auth_and_sudo_failures(self) -> None:
+    def simulate_auth_and_sudo_failures(self) -> CredentialSurfaceEvidence:
         server_id = self.server_ids()[0]
-        self.connect(server_id)
-        view = self._server.session_view(server_id)
         assert self._ssh_password is not None
         assert self._sudo_password is not None
-        assert self._server.provide_sudo_password(
-            server_id, view.generation, self._sudo_password
-        )
+
+        self.fail_next_ssh_authentication(server_id)
+        self.select(server_id)
+        self._window.server_sidebar.connect_button.click()
+        self._scheduler.pending(server_id, "reconnect").run_synchronously_for_test()
         service = self._service(server_id)
         tainted = CommandResult(
             False,
@@ -622,6 +675,9 @@ class ApplicationHarness:
                 self._sudo_password,
             ),
         )
+        service.next_add_port_error = SudoAuthenticationRequiredError(
+            server_id, "add_port"
+        )
         partial_snapshot = _replace_zone(
             self._snapshots[server_id],
             "public",
@@ -637,19 +693,50 @@ class ApplicationHarness:
             "public", "9443", "tcp", ApplyTarget.BOTH
         )
         self._install_confirmation()
+        self._install_sudo_dialog()
         self._window.ports_tab.add_button.click()
+        self._scheduler.pending(server_id, "add_port").run_synchronously_for_test()
         self._scheduler.pending(server_id, "add_port").run_synchronously_for_test()
         self._snapshots[server_id] = partial_snapshot
 
+        self._window.logs_tab.copy_button.click()
+        service_received_sudo = bool(
+            len(service.add_port_calls) >= 2
+            and service.add_port_calls[-2][-1] is None
+            and service.add_port_calls[-1][-1] == self._sudo_password
+            and service.load_calls
+            and service.load_calls[-1] == self._sudo_password
+        )
+        return CredentialSurfaceEvidence(
+            logs=self._server.log_entries(server_id),
+            errors=tuple(value for group in self._errors for value in group),
+            clipboard=QApplication.clipboard().text(),
+            widgets=tuple(
+                value
+                for root in (self._window, *self._sudo_dialogs)
+                for value in _widget_text(root)
+            ),
+            models=_model_text(self._window),
+            sessions=tuple(repr(view) for view in self._server.sessions()),
+            public_results=tuple(self._public_results),
+            sudo_prompted=bool(self._sudo_dialogs),
+            sudo_reached_fake_service=service_received_sudo,
+            sudo_widget_cleared=bool(self._sudo_dialogs)
+            and all(not dialog.password_edit.text() for dialog in self._sudo_dialogs),
+        )
+
+    def simulate_later_sudo_authentication_failure(self) -> str:
+        server_id = self.server_ids()[0]
+        service = self._service(server_id)
+        before_errors = len(self._errors)
         service.next_add_port_error = SudoAuthenticationError(server_id, "add_port")
         self._install_add_port_dialog("public", "8443", "tcp", ApplyTarget.BOTH)
         self._install_confirmation()
         self._window.ports_tab.add_button.click()
         self._scheduler.pending(server_id, "add_port").run_synchronously_for_test()
-        self._server.disconnect(server_id)
-        self._scheduler.pending(server_id, "disconnect").run_synchronously_for_test()
-        self.fail_next_ssh_authentication(server_id)
-        self._window.logs_tab.copy_button.click()
+        return "\n".join(
+            value for group in self._errors[before_errors:] for value in group
+        )
 
     def confirmation_text(self) -> str:
         return "\n".join(self._confirmations[-1]) if self._confirmations else ""
@@ -659,22 +746,7 @@ class ApplicationHarness:
 
     def visible_text(self) -> str:
         clipboard = QApplication.clipboard().text()
-        values = [*_widget_text(self._window), clipboard]
-        for tab in (
-            self._window.ports_tab,
-            self._window.services_tab,
-            self._window.zones_tab,
-            self._window.interfaces_tab,
-            self._window.rich_rules_tab,
-        ):
-            model = getattr(tab, "source_model", getattr(tab, "model", None))
-            if model is None:
-                continue
-            for row in range(model.rowCount()):
-                for column in range(model.columnCount()):
-                    value = model.data(model.index(row, column), Qt.ItemDataRole.DisplayRole)
-                    if value:
-                        values.append(str(value))
+        values = [*_widget_text(self._window), *_model_text(self._window), clipboard]
         return "\n".join(values)
 
     def error_text(self) -> str:
@@ -802,6 +874,22 @@ class ApplicationHarness:
             "app.gui.main_window.RichRuleDialog", AcceptedRichRuleDialog
         )
 
+    def _install_sudo_dialog(self) -> None:
+        owner = self
+        password = self._sudo_password
+        assert password is not None
+
+        class AcceptedSudoPasswordDialog(SudoPasswordDialog):
+            def exec(self) -> int:
+                owner._sudo_dialogs.append(self)
+                self.password_edit.setText(password)
+                self.accept()
+                return int(QDialog.DialogCode.Accepted)
+
+        self._monkeypatch.setattr(
+            "app.gui.main_window.SudoPasswordDialog", AcceptedSudoPasswordDialog
+        )
+
 
 @pytest.fixture
 def application_harness(qtbot, monkeypatch) -> ApplicationHarnessFactory:
@@ -811,6 +899,7 @@ def application_harness(qtbot, monkeypatch) -> ApplicationHarnessFactory:
 __all__ = [
     "ApplicationHarness",
     "ApplicationHarnessFactory",
+    "CredentialSurfaceEvidence",
     "OperationEvidence",
     "application_harness",
 ]
