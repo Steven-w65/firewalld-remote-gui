@@ -154,11 +154,28 @@ discards trust for every server and is not recommended.
 
 ## Use
 
-Start the GUI from the repository directory or any other working directory:
+From the repository directory, run:
 
 ```powershell
 python main.py
 ```
+
+From another working directory, pass an explicit absolute or relative path to
+`main.py`; a bare `python main.py` refers to the current directory and will not
+find the application there. For example, on Windows:
+
+```powershell
+python "D:\Tools\firewalld-remote-gui\main.py"
+```
+
+On Linux or macOS, the equivalent form is:
+
+```bash
+python /opt/firewalld-remote-gui/main.py
+```
+
+In either case, `config.yaml`, `known_hosts`, and `logs/` remain beside the
+executed `main.py`; they do not move to the shell's current directory.
 
 Select a profile and choose **Connect**. Startup and selection alone never open
 an SSH connection. Firewall changes follow a fixed flow: validate against the
