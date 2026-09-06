@@ -145,11 +145,12 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
     monkeypatch.setattr(
         main,
         "SSHManager",
-        lambda cfg, store, connect_timeout, command_timeout: (
+        lambda cfg, store, connect_timeout, command_timeout, *, client_factory: (
             cfg.id,
             store,
             connect_timeout,
             command_timeout,
+            client_factory,
         ),
     )
     assert manager_factory(server, controller.loaded.application) == (
@@ -157,6 +158,7 @@ def test_main_constructs_portable_dependencies_and_tears_down_once(
         known_hosts_file,
         4,
         9,
+        main.paramiko.SSHClient,
     )
 
 

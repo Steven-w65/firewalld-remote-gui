@@ -1,5 +1,5 @@
-PySide6
-paramiko
-PyYAML
-pytest
-pytest-qt
+PySide6>=6.6
+paramiko>=3.4
+PyYAML>=6.0.1
+pytest>=8.0
+pytest-qt>=4.4

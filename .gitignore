@@ -1,3 +1,25 @@
+# Python environments and bytecode
+.venv/
+.venv-clean/
 __pycache__/
 *.py[cod]
+
+# Test and coverage output
 .pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Portable secrets and application state beside main.py
+config.yaml
+known_hosts
+known_hosts.tmp
+.known_hosts.*.tmp
+logs/
+
+# Qt-generated caches and editor artifacts
+.qt_for_python/
+*.qmlc
+*.jsc
+*.ui.autosave
