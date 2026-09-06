@@ -173,15 +173,15 @@ def test_model_exposes_required_columns_safe_empty_roles_and_accessible_booleans
     assert not (model.flags(model.index(0, 3)) & Qt.ItemFlag.ItemIsUserCheckable)
 
 
-def test_ports_tab_centers_the_only_status_indicator_in_boolean_columns(qtbot):
+def test_ports_tab_centers_and_paints_status_indicators_in_boolean_columns(qtbot):
     class RecordingStyle(QProxyStyle):
         def __init__(self):
             super().__init__()
-            self.checkbox_rects: list[QRect] = []
+            self.checkbox_options: list[tuple[QRect, QStyle.StateFlag]] = []
 
         def drawPrimitive(self, element, option, painter, widget=None):
             if element is QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck:
-                self.checkbox_rects.append(QRect(option.rect))
+                self.checkbox_options.append((QRect(option.rect), option.state))
             super().drawPrimitive(element, option, painter, widget)
 
     tab = PortsTab()
@@ -193,17 +193,25 @@ def test_ports_tab_centers_the_only_status_indicator_in_boolean_columns(qtbot):
     tab.table.setStyle(recording_style)
     tab.show()
 
-    recording_style.checkbox_rects.clear()
+    recording_style.checkbox_options.clear()
     pixmap = QPixmap(tab.table.viewport().size())
     tab.table.viewport().render(pixmap)
 
-    for column in (3, 4):
-        cell_rect = tab.table.visualRect(tab.proxy_model.index(0, column))
+    runtime_only_row = _visible_ports(tab.proxy_model).index("100")
+    for column, expected_state in (
+        (3, QStyle.StateFlag.State_On),
+        (4, QStyle.StateFlag.State_Off),
+    ):
+        cell_rect = tab.table.visualRect(tab.proxy_model.index(runtime_only_row, column))
         indicators = [
-            rect for rect in recording_style.checkbox_rects if cell_rect.contains(rect.center())
+            (rect, state)
+            for rect, state in recording_style.checkbox_options
+            if cell_rect.contains(rect.center())
         ]
         assert len(indicators) == 1
-        assert indicators[0].center() == cell_rect.center()
+        indicator_rect, indicator_state = indicators[0]
+        assert indicator_rect.center() == cell_rect.center()
+        assert indicator_state & expected_state
 
 
 def test_set_rows_resets_model_and_sort_uses_numeric_port_bounds(qtbot):

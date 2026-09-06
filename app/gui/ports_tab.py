@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, Signal
+from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -63,6 +63,11 @@ class _CenteredCheckBoxDelegate(QStyledItemDelegate):
         centered.moveCenter(option.rect.center())
         checkbox_option = QStyleOptionViewItem(view_option)
         checkbox_option.rect = centered
+        checkbox_option.state |= (
+            QStyle.StateFlag.State_On
+            if view_option.checkState == Qt.CheckState.Checked
+            else QStyle.StateFlag.State_Off
+        )
         style.drawPrimitive(
             QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck,
             checkbox_option,
