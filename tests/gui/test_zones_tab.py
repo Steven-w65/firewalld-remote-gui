@@ -116,6 +116,7 @@ def test_zones_model_is_read_only_and_exposes_exact_zone_values(qtbot) -> None:
 
     assert model.rowCount() == 2
     assert model.headerData(0, Qt.Orientation.Horizontal) == "Zone"
+    assert model.headerData(1, Qt.Orientation.Horizontal) == "Runtime Active"
     assert model.data(model.index(0, 0)) == "internal"
     assert not (model.flags(model.index(0, 0)) & Qt.ItemFlag.ItemIsEditable)
     assert model.zones() == tuple(

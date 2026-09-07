@@ -12,7 +12,12 @@ from app.utils.errors import InvalidFirewallArgumentError
 from app.utils.validation import validate_inventory_token
 
 
-_HEADERS = ("Interface", "Runtime Zone", "Permanent Zone", "Active")
+_HEADERS = (
+    "Interface",
+    "Runtime Zone",
+    "Permanent Zone",
+    "Runtime Assigned",
+)
 
 
 def _assignments(

@@ -65,7 +65,7 @@ class OverviewTab(QWidget):
             summary_form, "Active runtime zones"
         )
         self.interfaces_value = self._add_value(
-            summary_form, "Assigned interfaces"
+            summary_form, "Runtime interface bindings"
         )
 
         self.snapshot_status_icon = QLabel()

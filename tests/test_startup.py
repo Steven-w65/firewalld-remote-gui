@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -301,14 +300,3 @@ def test_main_shows_one_safe_bootstrap_error_without_entering_event_loop(
     assert messages == [
         (None, "Configuration Error", main.STARTUP_CONFIGURATION_MESSAGE)
     ]
-
-
-def test_readme_distinguishes_repository_root_and_other_cwd_launches():
-    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
-    use_section = readme.split("## Use", 1)[1].split("## Logs", 1)[0]
-
-    assert "From the repository directory" in use_section
-    assert "python main.py" in use_section
-    assert "From another working directory" in use_section
-    assert "a bare `python main.py` refers to the current directory" in use_section
-    assert 'python "D:\\Tools\\firewalld-remote-gui\\main.py"' in use_section

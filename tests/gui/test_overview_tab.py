@@ -71,6 +71,7 @@ def test_overview_renders_connected_snapshot_without_inventing_inactive_zones(qt
     assert tab.default_zone_value.text() == "public"
     assert tab.active_zones_value.text() == "public"
     assert tab.interfaces_value.text() == "eth0 (public)"
+    assert tab.interfaces_value.accessibleName() == "Runtime interface bindings"
     assert tab.snapshot_status_label.text() == "Current firewall data"
     assert not tab.snapshot_status_icon.pixmap().isNull()
 

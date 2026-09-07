@@ -10,7 +10,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from app.models.firewall import FirewallSnapshot, ZoneState
 
 
-_HEADERS = ("Zone", "Active")
+_HEADERS = ("Zone", "Runtime Active")
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 from threading import Event
 
 import pytest
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QDialog
 
 from app.gui.dialogs.change_interface_dialog import ChangeInterfaceDialog
@@ -71,6 +71,15 @@ def test_interfaces_model_renders_unassigned_without_changing_row_value(qapp) ->
     del qapp
     model = InterfacesTableModel(interface_rows(_snapshot()))
 
+    assert tuple(
+        model.headerData(column, Qt.Orientation.Horizontal)
+        for column in range(model.columnCount())
+    ) == (
+        "Interface",
+        "Runtime Zone",
+        "Permanent Zone",
+        "Runtime Assigned",
+    )
     assert model.data(model.index(1, 2)) == "Unassigned"
     assert model.row_at(1) == InterfaceRow("eth1", "internal", None, True)
 

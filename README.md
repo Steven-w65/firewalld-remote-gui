@@ -223,7 +223,7 @@ Runtime + Permanent operations apply the permanent target first. Partial
 results are reported rather than silently rolled back. Permanent changes do
 not automatically reload firewalld.
 
-The Zones tab's **Active** column is always runtime-derived—even while viewing
+The Zones tab's **Runtime Active** column is always runtime-derived—even while viewing
 Permanent details. It follows `firewall-cmd --get-active-zones`, including
 legacy output such as `public (default)`.
 
@@ -292,9 +292,9 @@ shell, an interpreter, or package-management commands. Validate the policy with
 | **No active zone shown** | Compare with `firewall-cmd --get-active-zones`. A zone is active when the remote command reports it; the default zone can still process unmatched traffic. |
 | **firewalld not installed or stopped** | Install or start it through a separate trusted administration path, then reconnect. The GUI does not manage packages or services. |
 
-## Logs
+## Application logs
 
-The Logs tab shows only sanitized, in-memory entries for the selected server.
+The Application Logs tab shows only sanitized, in-memory entries for the selected server.
 **Clear View** does not remove rotating files; **Refresh** rereads the in-memory
 buffer; **Copy** copies only visible sanitized text.
 

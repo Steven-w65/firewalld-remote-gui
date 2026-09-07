@@ -233,7 +233,7 @@ def test_shell_has_exact_tab_order_and_real_management_tabs(window):
         "Zones",
         "Interfaces",
         "Rich Rules",
-        "Logs",
+        "Application Logs",
     )
     assert window.tabs.widget(0) is window.overview_tab
     assert window.tabs.widget(2) is window.services_tab
@@ -242,7 +242,15 @@ def test_shell_has_exact_tab_order_and_real_management_tabs(window):
     assert window.tabs.widget(5) is window.rich_rules_tab
     assert window.tabs.widget(6) is window.logs_tab
     assert window.overview_tab.accessibleName() == "Server overview"
-    assert window.logs_tab.accessibleName() == "Server logs"
+    assert window.logs_tab.accessibleName() == "Application logs"
+    assert (
+        window.logs_tab.status_label.accessibleName()
+        == "Application logs status"
+    )
+    assert (
+        window.logs_tab.text_view.accessibleName()
+        == "Sanitized application log entries"
+    )
     assert window.state_panels == []
 
 

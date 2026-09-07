@@ -63,7 +63,7 @@ _TAB_NAMES = (
     "Zones",
     "Interfaces",
     "Rich Rules",
-    "Logs",
+    "Application Logs",
 )
 
 _RECONNECTABLE_STATUSES = frozenset(
@@ -137,7 +137,7 @@ class MainWindow(QMainWindow):
                 self.tabs.addTab(self.interfaces_tab, tab_name)
             elif tab_name == "Rich Rules":
                 self.tabs.addTab(self.rich_rules_tab, tab_name)
-            elif tab_name == "Logs":
+            elif tab_name == "Application Logs":
                 self.tabs.addTab(self.logs_tab, tab_name)
             else:
                 panel = StatePanel(tab_name)

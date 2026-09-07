@@ -26,13 +26,13 @@ class LogsTab(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._server_id: str | None = None
-        self.setAccessibleName("Server logs")
+        self.setAccessibleName("Application logs")
 
         self.status_label = QLabel("No server selected")
-        self.status_label.setAccessibleName("Logs status")
+        self.status_label.setAccessibleName("Application logs status")
         self.text_view = QPlainTextEdit()
         self.text_view.setReadOnly(True)
-        self.text_view.setAccessibleName("Sanitized server log entries")
+        self.text_view.setAccessibleName("Sanitized application log entries")
         self.text_view.setPlaceholderText("No sanitized log entries are available.")
 
         self.clear_button = QPushButton("Clear view")
